@@ -165,7 +165,7 @@ fn read_some(stream: &mut TcpStream, buf: &mut [u8], deadline: Instant) -> Resul
     }
 }
 
-fn find_head_end(buf: &[u8]) -> Option<usize> {
+pub(crate) fn find_head_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == &b"\r\n\r\n"[..])
 }
 
@@ -233,7 +233,7 @@ pub struct PendingBody {
     /// The declared body length, if any.
     pub content_length: Option<usize>,
     /// Body bytes already read together with the head.
-    rest: Vec<u8>,
+    pub(crate) rest: Vec<u8>,
 }
 
 impl PendingBody {
@@ -318,6 +318,13 @@ pub fn read_head(stream: &mut TcpStream, initial: Vec<u8>) -> Result<PendingBody
         }
         buf.extend_from_slice(&chunk[..n]);
     };
+    parse_head(buf, head_end)
+}
+
+/// Parses a request head that ends (CRLF CRLF) at `head_end` in `buf`; any
+/// bytes after it are the start of the body. No I/O: `read_head` feeds it, and
+/// so does the fuzz harness (`fuzz.rs`).
+pub(crate) fn parse_head(buf: Vec<u8>, head_end: usize) -> Result<PendingBody, HttpError> {
     if head_end > MAX_HEAD {
         return Err(HttpError::HeadTooLarge);
     }

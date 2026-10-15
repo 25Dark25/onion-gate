@@ -145,7 +145,7 @@ impl Upstream {
 
 /// How the body of a parsed response is delimited.
 #[derive(Clone, Copy)]
-enum Body {
+pub(crate) enum Body {
     /// No body at all (a HEAD request, 204, 304).
     None,
     Length(usize),
@@ -155,19 +155,19 @@ enum Body {
 }
 
 /// A parsed response head (any interim 1xx heads already skipped).
-struct Head<'a> {
-    code: u16,
+pub(crate) struct Head<'a> {
+    pub(crate) code: u16,
     reason: &'a str,
     /// Headers to relay: hop-by-hop, framing and Connection-named ones removed.
-    headers: Vec<(&'a str, &'a str)>,
-    content_length: Option<usize>,
-    body_kind: Body,
+    pub(crate) headers: Vec<(&'a str, &'a str)>,
+    pub(crate) content_length: Option<usize>,
+    pub(crate) body_kind: Body,
     /// Everything after the head (may be incomplete while still reading).
-    body: &'a [u8],
+    pub(crate) body: &'a [u8],
 }
 
 /// Parses the response head. Ok(None) = the head is not complete yet.
-fn parse_head(raw: &[u8], head_only: bool) -> Result<Option<Head<'_>>, ProxyError> {
+pub(crate) fn parse_head(raw: &[u8], head_only: bool) -> Result<Option<Head<'_>>, ProxyError> {
     let mut rest = raw;
     loop {
         let end = match rest.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -366,7 +366,7 @@ fn dropped_request_header(lname: &str) -> bool {
 }
 
 /// Builds the request line + headers + body to send to the upstream.
-fn build_request(req: &Request, pass_cookie: &str) -> Vec<u8> {
+pub(crate) fn build_request(req: &Request, pass_cookie: &str) -> Vec<u8> {
     // Headers named in the client's `Connection` header are hop-by-hop too.
     let named: Vec<String> = req
         .headers
@@ -420,7 +420,7 @@ fn build_request(req: &Request, pass_cookie: &str) -> Vec<u8> {
 /// headers dropped, body de-chunked if needed, `Content-Length` and
 /// `Connection: close` set by us. `head_only` (a HEAD request) keeps the
 /// upstream's Content-Length and sends no body.
-fn frame_response(raw: &[u8], head_only: bool) -> Result<Vec<u8>, ProxyError> {
+pub(crate) fn frame_response(raw: &[u8], head_only: bool) -> Result<Vec<u8>, ProxyError> {
     let h = parse_head(raw, head_only)?.ok_or(ProxyError::BadResponse)?;
     // The body's length, found without copying it (the copy is made once,
     // straight into the output).
@@ -474,7 +474,8 @@ fn frame_response(raw: &[u8], head_only: bool) -> Result<Vec<u8>, ProxyError> {
     Ok(bytes)
 }
 
-/// `HTTP/1.1 200 OK` -> 200.
+/// `HTTP/1.1 200 OK` -> 200. Only 100..=599 are status codes (RFC 9110 §15);
+/// anything else would be relayed as an invalid status line.
 fn parse_status(line: &str) -> Option<u16> {
     let mut it = line.split(' ');
     let v = it.next()?;
@@ -485,7 +486,7 @@ fn parse_status(line: &str) -> Option<u16> {
     if code.len() != 3 || !code.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    code.parse::<u16>().ok()
+    code.parse::<u16>().ok().filter(|c| (100..=599).contains(c))
 }
 
 /// Longest chunk-size line (size plus any extension) and longest trailer
@@ -495,7 +496,7 @@ const MAX_TRAILERS: usize = 16 * 1024;
 
 /// Outcome of walking a chunked body.
 #[derive(Debug, PartialEq, Eq)]
-enum Walk {
+pub(crate) enum Walk {
     /// The last chunk and the trailer section (if any) are complete.
     Done,
     /// The data stops before the body is complete.
@@ -524,7 +525,7 @@ fn chunk_size(line: &[u8]) -> Option<usize> {
 /// complete chunk, so a caller that gets `More` can call again with more data
 /// and the same `pos` (linear overall). Trailers are checked for their end and
 /// otherwise ignored.
-fn walk_chunks(data: &[u8], pos: &mut usize, mut each: impl FnMut(&[u8])) -> Walk {
+pub(crate) fn walk_chunks(data: &[u8], pos: &mut usize, mut each: impl FnMut(&[u8])) -> Walk {
     loop {
         let nl = match find_crlf(data, *pos) {
             Some(nl) if nl <= MAX_CHUNK_LINE => nl,
@@ -717,6 +718,19 @@ mod tests {
         // a truncated response is refused when framed
         assert!(frame_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhi", false).is_err());
         assert!(frame_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", false).is_err(), "chunked twice");
+    }
+
+    #[test]
+    fn a_status_code_outside_100_to_599_is_bad_gateway() {
+        // "000" used to be relayed as "HTTP/1.1 0 OK", an invalid status line.
+        for code in ["000", "099", "600", "999"] {
+            let raw = format!("HTTP/1.1 {} OK\r\nContent-Length: 0\r\n\r\n", code);
+            assert!(frame_response(raw.as_bytes(), false).is_err(), "{} relayed", code);
+        }
+        for code in ["100 x\r\n\r\nHTTP/1.1 200", "200", "418", "599"] {
+            let raw = format!("HTTP/1.1 {} OK\r\nContent-Length: 0\r\n\r\n", code);
+            assert!(frame_response(raw.as_bytes(), false).is_ok(), "{} refused", code);
+        }
     }
 
     #[test]

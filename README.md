@@ -200,8 +200,8 @@ it.
 | Request head / target cap | 16 KiB / 2 KiB | `MAX_HEAD`, `MAX_TARGET` in `src/http.rs` |
 | Read deadlines (head / body) | 8 s / 60 s | `READ_DEADLINE`, `BODY_DEADLINE` in `src/http.rs` |
 | Upstream response cap / timeouts | 8 MiB / 5 s connect, 30 s I/O | top of `src/upstream.rs` |
-| Buffered bytes, all connections | 128 MiB | `MAX_BUFFERED` in `src/limit.rs` |
-| Time to deliver one response | 300 s | `SEND_DEADLINE` in `src/http.rs` |
+| Buffered bytes: all / per circuit / per pass | 128 / 24 / 32 MiB | `MAX_BUFFERED`, `MAX_BUFFERED_PER_CIRCUIT`, `MAX_BUFFERED_PER_PASS` in `src/limit.rs` |
+| Time to deliver one response | 30 s + size at 16 KiB/s, at most 300 s | `SEND_GRACE`, `MIN_SEND_RATE`, `SEND_DEADLINE` in `src/http.rs` |
 | Image difficulty | — | constants at the top of `src/captcha.rs` |
 | CAPTCHA page text and style | — | `src/html.rs` |
 
@@ -240,8 +240,9 @@ Guarantees (as far as the code goes):
   throughout.
 - **Loopback only:** listens on `127.0.0.1`; the upstream must be loopback too.
 - **No visitor data added** to forwarded requests; the pass cookie is stripped.
-- **Bounded memory** in every store and for all buffered bodies together, and
-  no request body buffered (beyond 1 KiB) for a visitor without a valid pass.
+- **Bounded memory** in every store and for all buffered bodies together (with
+  a share per circuit and per pass), and no request body buffered (beyond
+  1 KiB) for a visitor without a valid pass.
 
 ## Limitations
 
@@ -261,12 +262,17 @@ Be honest with yourself about what this is:
   Protocols` is refused), no HTTP/2, no large uploads/downloads beyond the
   caps. Raise `--max-body`, the response cap and the budget if you need more,
   at a memory cost.
-- **Slow readers hold their response.** A visitor with a valid pass who reads
-  very slowly keeps its buffered response, and its share of the budget, for up
-  to `SEND_DEADLINE` (300 s). The per-circuit connection limit bounds how much
-  one circuit can hold this way, not how much many circuits can. A site that
-  serves large files to untrusted visitors should keep them out of reach of
-  the gate or lower the response cap.
+- **Slow readers hold their response, within limits.** A visitor with a valid
+  pass who reads very slowly keeps its buffered response until it is delivered
+  or its deadline passes: 30 s plus the time to send it at 16 KiB/s, at most
+  300 s. One circuit can hold at most 24 MiB of the budget this way and one
+  pass at most 32 MiB, so filling the whole 128 MiB takes at least 6 circuits
+  and 4 passes (8 solved CAPTCHAs); while it lasts, other forwarded requests
+  get `503`. The responses are buffered rather than streamed on purpose:
+  streaming would hand the slow reader to your backend instead, tying up its
+  workers (the classic slow-client problem a buffering proxy exists to absorb).
+  A site that serves large files to untrusted visitors should lower the
+  response cap or serve them elsewhere.
 - **Strict about the backend too.** A response with a `Transfer-Encoding` other
   than plain `chunked`, conflicting `Content-Length`s, a header name that is not
   a token, or control bytes or non-UTF-8 bytes in the status line or a header is

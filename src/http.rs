@@ -37,11 +37,20 @@ const PROXY_DEADLINE: Duration = Duration::from_secs(2);
 const MAX_PROXY_LINE: usize = 107;
 /// Longest any write may block before the connection is dropped...
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-/// ...and the total time allowed to deliver one response. A visitor reading
-/// very slowly would otherwise keep its buffered response (and its share of
-/// the memory budget) indefinitely, as long as each write made some progress.
-/// 8 MiB at a slow 30 KB/s over Tor takes under 300 s.
+/// ...and the total time allowed to deliver one response: SEND_GRACE plus the
+/// time to send it at MIN_SEND_RATE, never more than SEND_DEADLINE. A visitor
+/// reading very slowly would otherwise keep its buffered response (and its
+/// share of the memory budget) for as long as each write made some progress.
+/// 16 KiB/s is far below what an onion circuit delivers.
 pub const SEND_DEADLINE: Duration = Duration::from_secs(300);
+pub const SEND_GRACE: Duration = Duration::from_secs(30);
+pub const MIN_SEND_RATE: u64 = 16 * 1024;
+
+/// How long `len` bytes may take to deliver.
+pub fn send_deadline(len: usize) -> Duration {
+    let at_min_rate = Duration::from_secs(len as u64 / MIN_SEND_RATE);
+    (SEND_GRACE + at_min_rate).min(SEND_DEADLINE)
+}
 
 /// Request methods the gate accepts and will forward. Anything else is 405.
 pub const METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"];
@@ -549,9 +558,10 @@ fn write_reply(stream: &mut TcpStream, r: &Reply, with_body: bool) {
 }
 
 /// Writes already-framed response bytes (used for a relayed upstream response).
-/// Gives up silently after SEND_DEADLINE, or a write blocked for WRITE_TIMEOUT.
+/// Gives up silently after `send_deadline(len)`, or a write blocked for
+/// WRITE_TIMEOUT.
 pub fn send_raw(stream: &mut TcpStream, bytes: &[u8]) {
-    let deadline = Instant::now() + SEND_DEADLINE;
+    let deadline = Instant::now() + send_deadline(bytes.len());
     let mut off = 0;
     while off < bytes.len() {
         let left = match deadline.checked_duration_since(Instant::now()) {
@@ -655,6 +665,15 @@ mod tests {
         for bad in ["a\rb", "a\nb", "a\x00b", "a\x7fb", "a\x1bb"] {
             assert!(!is_field_text(bad), "{:?}", bad);
         }
+    }
+
+    #[test]
+    fn send_deadline_scales_with_size_and_is_capped() {
+        assert_eq!(send_deadline(0), SEND_GRACE);
+        assert_eq!(send_deadline(100 * 1024), SEND_GRACE + Duration::from_secs(6));
+        assert_eq!(send_deadline(1024 * 1024), SEND_GRACE + Duration::from_secs(64));
+        assert_eq!(send_deadline(8 * 1024 * 1024), SEND_DEADLINE);
+        assert_eq!(send_deadline(usize::MAX), SEND_DEADLINE);
     }
 
     #[test]

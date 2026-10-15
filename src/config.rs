@@ -162,6 +162,8 @@ pub struct Config {
     pub upstream: String,
     /// Read tor's PROXY line on every connection (per-circuit limits).
     pub proxy_protocol: bool,
+    /// Port on 127.0.0.1 for the metrics page; 0 = off.
+    pub metrics_port: u16,
     pub limits: Limits,
 }
 
@@ -182,6 +184,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("port", "Port to listen on. onion-gate listens on 127.0.0.1 only."),
     ("upstream", "The backend to protect, host:port. Must resolve to loopback. Required."),
     ("proxy_protocol", "Read tor's PROXY line (HiddenServiceExportCircuitID haproxy). Needed for per-circuit limits: use yes behind tor."),
+    ("metrics_port", "Port on 127.0.0.1 for aggregate metrics (GET /metrics, Prometheus text). 0 = off. Never point tor at it."),
     ("rounds", "CAPTCHA rounds in a row needed for a pass (1-5)."),
     ("challenge_ttl", "How long a challenge image is valid; the page shows a bar for it."),
     ("pass_idle", "A pass unused for this long expires."),
@@ -208,6 +211,7 @@ impl Config {
             port: 8088,
             upstream: String::new(),
             proxy_protocol: false,
+            metrics_port: 0,
             limits: Limits::default(),
         }
     }
@@ -227,6 +231,7 @@ impl Config {
                 self.upstream = v.to_string();
             }
             "proxy_protocol" => self.proxy_protocol = boolean(v).ok_or_else(|| bad("yes or no"))?,
+            "metrics_port" => self.metrics_port = v.parse().map_err(|_| bad("a port, or 0 for off"))?,
             "rounds" => l.rounds = v.parse().map_err(|_| bad("a number"))?,
             "challenge_ttl" => l.challenge_ttl = duration(v).ok_or_else(|| bad("a duration (30s, 5m)"))?,
             "pass_idle" => l.pass_idle = duration(v).ok_or_else(|| bad("a duration (30s, 5m, 2h)"))?,
@@ -257,6 +262,7 @@ impl Config {
             "port" => self.port.to_string(),
             "upstream" => self.upstream.clone(),
             "proxy_protocol" => (if self.proxy_protocol { "yes" } else { "no" }).to_string(),
+            "metrics_port" => self.metrics_port.to_string(),
             "rounds" => l.rounds.to_string(),
             "challenge_ttl" => show_duration(l.challenge_ttl),
             "pass_idle" => show_duration(l.pass_idle),
@@ -328,6 +334,9 @@ impl Config {
         let mut p = Vec::new();
         if self.upstream.is_empty() {
             p.push("upstream is required: the backend to protect, e.g. upstream = 127.0.0.1:3000".to_string());
+        }
+        if self.metrics_port != 0 && self.metrics_port == self.port {
+            p.push("metrics_port must differ from port".to_string());
         }
         p.extend(self.limits.problems());
         p

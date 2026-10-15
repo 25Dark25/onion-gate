@@ -265,6 +265,12 @@ impl Store {
         self.lock().passes.remove(token);
     }
 
+    /// (pending challenges, passes held): for the metrics.
+    pub fn sizes(&self) -> (usize, usize) {
+        let g = self.lock();
+        (g.challenges.len(), g.passes.len())
+    }
+
     /// The secret of a registered challenge (its undistorted click target).
     /// Exposed so an integration test (or a harness) can solve a challenge.
     pub fn peek(&self, token: &Token) -> Option<Secret> {

@@ -6,16 +6,13 @@
 
 use onion_gate::config::{self, Action, Config, KEYS};
 use onion_gate::upstream::Upstream;
-use onion_gate::{serve_connection, App, COOKIE};
+use onion_gate::{metrics, serve_connection, App, COOKIE};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 const STACK_SIZE: usize = 512 * 1024;
-
-static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
 const USAGE: &str = "\
 usage: onion-gate [--config=FILE] [--KEY=VALUE ...] [--check | --print-config]
@@ -43,6 +40,10 @@ fn validate(cfg: &Config) -> Result<Upstream, Vec<String>> {
     let mut upstream = None;
     if !cfg.upstream.is_empty() {
         match Upstream::new(&cfg.upstream, COOKIE) {
+            Ok(u) if cfg.metrics_port != 0 && points_at_self(u.addrs(), cfg.metrics_port) => problems.push(format!(
+                "upstream {} is onion-gate's metrics port; point it at the backend",
+                cfg.upstream
+            )),
             Ok(u) if points_at_self(u.addrs(), cfg.port) => problems.push(format!(
                 "upstream {} is onion-gate's own address; point it at the backend",
                 cfg.upstream
@@ -71,6 +72,7 @@ fn help() {
         port: 8088,
         upstream: String::new(),
         proxy_protocol: false,
+        metrics_port: 0,
         limits: Default::default(),
     }
     .to_file();
@@ -126,8 +128,24 @@ fn main() {
         );
     }
 
-    let max_conn = l.max_conn;
+    let max_conn = l.max_conn as u64;
+    let metrics_listener = match cfg.metrics_port {
+        0 => None,
+        p => match TcpListener::bind((Ipv4Addr::LOCALHOST, p)) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                eprintln!("onion-gate: could not listen on 127.0.0.1:{} (metrics_port): {}", p, e);
+                std::process::exit(1);
+            }
+        },
+    };
     let app = Arc::new(App::new(upstream, cfg.proxy_protocol, cfg.limits));
+    if let Some(m) = metrics_listener {
+        eprintln!("metrics on http://127.0.0.1:{}/metrics", cfg.metrics_port);
+        let a = Arc::clone(&app);
+        thread::spawn(move || metrics::serve(m, &a));
+    }
+
     for conn in listener.incoming() {
         let stream = match conn {
             Ok(s) => s,
@@ -136,20 +154,31 @@ fn main() {
                 continue;
             }
         };
-        if ACTIVE.fetch_add(1, Ordering::SeqCst) >= max_conn {
-            ACTIVE.fetch_sub(1, Ordering::SeqCst);
+        let m = &app.metrics;
+        if m.conn_open.get() >= max_conn {
+            m.conn_refused.inc();
             drop(stream);
             continue;
         }
+        m.conn_open.inc();
+        m.conn_accepted.inc();
         let a = Arc::clone(&app);
         let spawned = thread::Builder::new().stack_size(STACK_SIZE).spawn(move || {
-            let _guard = ConnGuard;
+            let _open = OpenConn(&a);
             let mut stream = stream;
             serve_connection(&mut stream, &a);
         });
         if spawned.is_err() {
-            ACTIVE.fetch_sub(1, Ordering::SeqCst);
+            m.conn_open.dec();
         }
+    }
+}
+
+/// Counts the connection as open until its thread ends, however it ends.
+struct OpenConn<'a>(&'a App);
+impl Drop for OpenConn<'_> {
+    fn drop(&mut self) {
+        self.0.metrics.conn_open.dec();
     }
 }
 
@@ -170,13 +199,6 @@ fn check(cfg: &Config) {
     }
     if !cfg.proxy_protocol {
         println!("warning: proxy_protocol is off: fine for a local test, not behind tor");
-    }
-}
-
-struct ConnGuard;
-impl Drop for ConnGuard {
-    fn drop(&mut self) {
-        ACTIVE.fetch_sub(1, Ordering::SeqCst);
     }
 }
 

@@ -7,7 +7,9 @@
 //!    non-numeric `Content-Length` is rejected.
 //!  - Hard limits: 16 KiB head, a configurable body cap, an 8 s deadline for
 //!    the head (anti-slowloris) and 60 s more for a body, a 2 KiB target.
-//!  - Control bytes, non-ASCII, stray CR/LF and "obs-fold" => 400.
+//!  - Control bytes, non-ASCII, stray CR/LF, "obs-fold", a header name that
+//!    is not a token, a tab in the target, and a missing (HTTP/1.1) or
+//!    repeated `Host` => 400.
 //!  - Nothing about requests is logged (no access logs).
 //!
 //! The request is parsed once. The gate reads `method`/`path` to decide what to
@@ -16,6 +18,7 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, TcpStream};
+use crate::limit::Reservation;
 use std::time::{Duration, Instant};
 
 const MAX_HEAD: usize = 16 * 1024;
@@ -32,6 +35,13 @@ const BODY_DEADLINE: Duration = Duration::from_secs(60);
 const PROXY_DEADLINE: Duration = Duration::from_secs(2);
 /// Maximum length of a PROXY v1 line per its specification (CRLF included).
 const MAX_PROXY_LINE: usize = 107;
+/// Longest any write may block before the connection is dropped...
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// ...and the total time allowed to deliver one response. A visitor reading
+/// very slowly would otherwise keep its buffered response (and its share of
+/// the memory budget) indefinitely, as long as each write made some progress.
+/// 8 MiB at a slow 30 KB/s over Tor takes under 300 s.
+pub const SEND_DEADLINE: Duration = Duration::from_secs(300);
 
 /// Request methods the gate accepts and will forward. Anything else is 405.
 pub const METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"];
@@ -70,6 +80,8 @@ pub enum HttpError {
     LengthRequired,
     TooLarge,
     HeadTooLarge,
+    /// The memory budget for buffered bodies is spent.
+    Busy,
     /// The client closed / I/O error: nothing is sent back.
     Closed,
 }
@@ -83,6 +95,7 @@ impl HttpError {
             HttpError::LengthRequired => Some(411),
             HttpError::TooLarge => Some(413),
             HttpError::HeadTooLarge => Some(431),
+            HttpError::Busy => Some(503),
             HttpError::Closed => None,
         }
     }
@@ -109,7 +122,7 @@ impl Reply {
     }
 
     /// 303 See Other: after a POST, the browser requests `location` with GET.
-    /// `location` must be a sanitized same-origin path (see `gate`).
+    /// `location` must be a sanitized same-origin path (see `safe_return_path` in lib.rs).
     pub fn redirect(location: String) -> Reply {
         Reply {
             status: 303,
@@ -202,9 +215,81 @@ pub fn parse_proxy(line: &str) -> Option<u32> {
     }
 }
 
+/// A request whose head has been read and validated, and whose body (if any)
+/// has not been read yet. The caller decides how much body it is willing to
+/// buffer once it knows who is asking (see `lib.rs`).
+pub struct PendingBody {
+    /// The request, with an empty `body`.
+    pub req: Request,
+    /// The declared body length, if any.
+    pub content_length: Option<usize>,
+    /// Body bytes already read together with the head.
+    rest: Vec<u8>,
+}
+
+impl PendingBody {
+    /// Reads the body. More than `max_body` declared => TooLarge, nothing read.
+    /// With `mem`, every byte that arrives is charged to it (twice: the body is
+    /// copied into the forwarded request) as it arrives, never upfront, so a
+    /// declared length that is never sent costs nothing. Over budget => Busy.
+    pub fn read_body(
+        self,
+        stream: &mut TcpStream,
+        max_body: usize,
+        mut mem: Option<&mut Reservation<'_>>,
+    ) -> Result<Request, HttpError> {
+        let PendingBody { mut req, content_length, rest } = self;
+        let cl = match content_length {
+            Some(cl) => cl,
+            None => return Ok(req),
+        };
+        if cl > max_body {
+            return Err(HttpError::TooLarge);
+        }
+        let mut charge = |n: usize| match mem.as_deref_mut() {
+            Some(r) => {
+                if r.grow(n.saturating_mul(2)) {
+                    Ok(())
+                } else {
+                    Err(HttpError::Busy)
+                }
+            }
+            None => Ok(()),
+        };
+        let mut body = rest;
+        body.truncate(cl);
+        charge(body.len())?;
+        let mut chunk = [0u8; 1024];
+        let body_deadline = Instant::now() + BODY_DEADLINE;
+        while body.len() < cl {
+            let n = read_some(stream, &mut chunk, body_deadline)?;
+            if n == 0 {
+                return Err(HttpError::Closed);
+            }
+            let n = n.min(cl - body.len()); // anything extra (pipelining) is discarded
+            charge(n)?;
+            body.extend_from_slice(&chunk[..n]);
+        }
+        req.body = body;
+        Ok(req)
+    }
+
+    /// Gives up on the body: the request is handled as if it had none, and the
+    /// unread bytes are left on the socket (the connection is closed after the
+    /// reply anyway).
+    pub fn skip_body(self) -> Request {
+        self.req
+    }
+}
+
 /// Reads one HTTP request. `initial` holds bytes already read (whatever followed
 /// the PROXY line, or nothing). `max_body` caps the request body.
 pub fn read_request(stream: &mut TcpStream, initial: Vec<u8>, max_body: usize) -> Result<Request, HttpError> {
+    read_head(stream, initial)?.read_body(stream, max_body, None)
+}
+
+/// Reads and validates the request line and headers, but not the body.
+pub fn read_head(stream: &mut TcpStream, initial: Vec<u8>) -> Result<PendingBody, HttpError> {
     let deadline = Instant::now() + READ_DEADLINE;
     let mut buf: Vec<u8> = initial;
     buf.reserve(1024);
@@ -250,7 +335,9 @@ pub fn read_request(stream: &mut TcpStream, initial: Vec<u8>, max_body: usize) -
     if version != "HTTP/1.1" && version != "HTTP/1.0" {
         return Err(HttpError::Bad);
     }
-    if !target.starts_with('/') || target.len() > MAX_TARGET {
+    // Visible ASCII only: a tab (allowed by safe_head) would be forwarded inside
+    // the request line, where some backends split on any whitespace.
+    if !target.starts_with('/') || target.len() > MAX_TARGET || !target.bytes().all(|b| (0x21..=0x7E).contains(&b)) {
         return Err(HttpError::Bad);
     }
     if !METHODS.contains(&m) {
@@ -262,6 +349,7 @@ pub fn read_request(stream: &mut TcpStream, initial: Vec<u8>, max_body: usize) -
     // 3) headers
     let mut content_length: Option<usize> = None;
     let mut cookie: Option<String> = None;
+    let mut hosts = 0usize;
     let mut headers: Vec<(String, String)> = Vec::new();
     for line in lines {
         if line.contains('\r') || line.contains('\n') {
@@ -271,10 +359,13 @@ pub fn read_request(stream: &mut TcpStream, initial: Vec<u8>, max_body: usize) -
             return Err(HttpError::Bad); // obs-fold
         }
         let (name, value) = line.split_once(':').ok_or(HttpError::Bad)?;
-        if name.is_empty() || name.bytes().any(|b| b == b' ' || b == b'\t') {
+        if !is_token(name) {
             return Err(HttpError::Bad);
         }
         let value = value.trim_matches(|c: char| c == ' ' || c == '\t');
+        if name.eq_ignore_ascii_case("host") {
+            hosts += 1;
+        }
 
         if name.eq_ignore_ascii_case("content-length") {
             if content_length.is_some() {
@@ -292,43 +383,52 @@ pub fn read_request(stream: &mut TcpStream, initial: Vec<u8>, max_body: usize) -
         headers.push((name.to_string(), value.to_string()));
     }
 
-    // 4) body (only when a Content-Length is given; GET/HEAD usually have none)
-    let mut body: Vec<u8> = Vec::new();
-    match content_length {
-        Some(cl) => {
-            if cl > max_body {
-                return Err(HttpError::TooLarge);
-            }
-            body.extend_from_slice(&buf[head_end + 4..]);
-            let body_deadline = Instant::now() + BODY_DEADLINE;
-            while body.len() < cl {
-                let n = read_some(stream, &mut chunk, body_deadline)?;
-                if n == 0 {
-                    return Err(HttpError::Closed);
-                }
-                body.extend_from_slice(&chunk[..n]);
-            }
-            body.truncate(cl); // anything extra (pipelining) is discarded
-        }
-        None => {
-            // No body. POST/PUT/PATCH without a length cannot be framed safely.
-            if matches!(m, "POST" | "PUT" | "PATCH") {
-                return Err(HttpError::LengthRequired);
-            }
-        }
+    // RFC 9112 §3.2: an HTTP/1.1 request needs exactly one Host, and two would
+    // let the gate and the backend disagree about which site is meant.
+    if hosts > 1 || (hosts == 0 && version == "HTTP/1.1") {
+        return Err(HttpError::Bad);
     }
 
-    Ok(Request {
-        method,
-        target: target.to_string(),
-        path,
-        headers,
-        cookie,
-        body,
+    // 4) the body is read later (PendingBody::read_body), once the caller knows
+    //    how much it will accept. POST/PUT/PATCH without a length cannot be
+    //    framed safely.
+    if content_length.is_none() && matches!(m, "POST" | "PUT" | "PATCH") {
+        return Err(HttpError::LengthRequired);
+    }
+
+    let rest = buf[head_end + 4..].to_vec();
+    Ok(PendingBody {
+        req: Request {
+            method,
+            target: target.to_string(),
+            path,
+            headers,
+            cookie,
+            body: Vec::new(),
+        },
+        content_length,
+        rest,
     })
 }
 
 // ------------------------------------------------------------ parsing helpers
+
+/// A header field name: a non-empty RFC 9110 token (letters, digits and
+/// ``!#$%&'*+-.^_`|~``). Anything else (spaces, separators, controls) is refused
+/// rather than forwarded for a backend to interpret its own way.
+pub fn is_token(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
+/// Text allowed in a header value or a reason phrase: no control bytes except
+/// tab (so no CR or LF that could start a new line), no DEL. Bytes >= 0x80
+/// (obs-text) are allowed.
+pub fn is_field_text(s: &str) -> bool {
+    s.bytes().all(|b| b == b'\t' || (b >= 0x20 && b != 0x7F))
+}
 
 /// Value of `key` in an application/x-www-form-urlencoded body.
 /// None if missing or present more than once (no ambiguity).
@@ -415,6 +515,16 @@ Cross-Origin-Opener-Policy: same-origin\r\n\
 Content-Security-Policy: default-src 'none'; img-src data:; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'\r\n";
 
 pub fn send(stream: &mut TcpStream, r: &Reply) {
+    write_reply(stream, r, true);
+}
+
+/// The reply to a HEAD request: the same headers (Content-Length included, as
+/// for GET), no body.
+pub fn send_head(stream: &mut TcpStream, r: &Reply) {
+    write_reply(stream, r, false);
+}
+
+fn write_reply(stream: &mut TcpStream, r: &Reply, with_body: bool) {
     let mut head = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}",
         r.status,
@@ -432,14 +542,32 @@ pub fn send(stream: &mut TcpStream, r: &Reply) {
     head.push_str("Connection: close\r\n\r\n");
 
     let mut out = head.into_bytes();
-    out.extend_from_slice(r.body.as_bytes());
-    let _ = stream.write_all(&out);
-    let _ = stream.flush();
+    if with_body {
+        out.extend_from_slice(r.body.as_bytes());
+    }
+    send_raw(stream, &out);
 }
 
 /// Writes already-framed response bytes (used for a relayed upstream response).
+/// Gives up silently after SEND_DEADLINE, or a write blocked for WRITE_TIMEOUT.
 pub fn send_raw(stream: &mut TcpStream, bytes: &[u8]) {
-    let _ = stream.write_all(bytes);
+    let deadline = Instant::now() + SEND_DEADLINE;
+    let mut off = 0;
+    while off < bytes.len() {
+        let left = match deadline.checked_duration_since(Instant::now()) {
+            Some(d) if !d.is_zero() => d.min(WRITE_TIMEOUT),
+            _ => return,
+        };
+        if stream.set_write_timeout(Some(left)).is_err() {
+            return;
+        }
+        match stream.write(&bytes[off..]) {
+            Ok(0) => return,
+            Ok(n) => off += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        }
+    }
     let _ = stream.flush();
 }
 
@@ -515,6 +643,18 @@ mod tests {
         assert_eq!(cookie_without("pass=xyz; pass=abc", "pass"), None);
         assert_eq!(cookie_without("a=1", "pass").as_deref(), Some("a=1"));
         assert_eq!(cookie_without("", "pass"), None);
+    }
+
+    #[test]
+    fn token_and_field_text() {
+        assert!(is_token("Content-Type") && is_token("X_Custom") && is_token("a!#$%&'*+-.^_`|~9"));
+        for bad in ["", "X Y", "X(y)", "X:y", "X\"y", "X/y", "X\u{e9}", "X\ty"] {
+            assert!(!is_token(bad), "{:?}", bad);
+        }
+        assert!(is_field_text("text/html; charset=utf-8") && is_field_text("a\tb") && is_field_text("caf\u{e9}"));
+        for bad in ["a\rb", "a\nb", "a\x00b", "a\x7fb", "a\x1bb"] {
+            assert!(!is_field_text(bad), "{:?}", bad);
+        }
     }
 
     #[test]

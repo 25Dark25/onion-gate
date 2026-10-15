@@ -5,6 +5,7 @@
 
 use onion_gate::store::{from_hex, to_hex, Store, Token};
 use onion_gate::upstream::Upstream;
+use onion_gate::limit::Memory;
 use onion_gate::{captcha, limit::Limiter, serve_connection, App, COOKIE, ROUNDS};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
@@ -68,6 +69,10 @@ fn start() -> (u16, Arc<App>) {
 }
 
 fn start_with(linger: bool) -> (u16, Arc<App>) {
+    start_custom(linger, Memory::default())
+}
+
+fn start_custom(linger: bool, memory: Memory) -> (u16, Arc<App>) {
     let backend = backend(linger);
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -77,6 +82,7 @@ fn start_with(linger: bool) -> (u16, Arc<App>) {
         upstream: Upstream::new(&backend, COOKIE).unwrap(),
         proxy: true,
         max_body: 64 * 1024,
+        memory,
     });
     let a = Arc::clone(&app);
     thread::spawn(move || {
@@ -216,21 +222,44 @@ fn no_open_redirect_through_the_return_path() {
     assert!(!done.contains("evil.onion"));
 }
 
+/// Sends `request` verbatim (after a PROXY line) and returns the response.
+fn send_raw(port: u16, circuit: u32, request: &str) -> String {
+    let mut s = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(format!("{}{}", proxy_line(circuit), request).as_bytes()).unwrap();
+    let mut out = Vec::new();
+    s.read_to_end(&mut out).unwrap();
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[test]
 fn header_smuggling_is_rejected() {
     let (port, _app) = start();
     // A bare LF inside the headers must not split into an extra header line.
-    let raw = format!(
-        "{}GET / HTTP/1.1\r\nHost: t.onion\r\nX: a\nSmuggled: 1\r\n\r\n",
-        proxy_line(0x3333_3333)
-    );
-    let mut s = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
-    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    s.write_all(raw.as_bytes()).unwrap();
-    let mut out = String::new();
-    s.read_to_string(&mut out).unwrap();
+    let out = send_raw(port, 0x3333_3333, "GET / HTTP/1.1\r\nHost: t.onion\r\nX: a\nSmuggled: 1\r\n\r\n");
     assert!(out.starts_with("HTTP/1.1 400"), "a lone LF in headers must be a 400, got:\n{}", &out[..out.len().min(80)]);
     assert!(!out.contains("BACKEND"));
+}
+
+#[test]
+fn ambiguous_requests_are_rejected_before_any_forwarding() {
+    let (port, app) = start();
+    let c = 0x3434_3434;
+    let pass = pass_for(port, app.as_ref(), c);
+    let cookie = format!("Cookie: {}={}\r\n", COOKIE, pass);
+    for (what, req) in [
+        ("a tab in the target", format!("GET /a\tHTTP/1.0 HTTP/1.1\r\nHost: t.onion\r\n{}\r\n", cookie)),
+        ("two Host headers", format!("GET / HTTP/1.1\r\nHost: t.onion\r\nHost: other\r\n{}\r\n", cookie)),
+        ("HTTP/1.1 without Host", format!("GET / HTTP/1.1\r\n{}\r\n", cookie)),
+        ("a header name that is not a token", format!("GET / HTTP/1.1\r\nHost: t.onion\r\nX(y): 1\r\n{}\r\n", cookie)),
+    ] {
+        let out = send_raw(port, c, &req);
+        assert!(out.starts_with("HTTP/1.1 400"), "{} must be a 400, got:\n{}", what, &out[..out.len().min(80)]);
+        assert!(!out.contains("BACKEND"), "{} reached the backend", what);
+    }
+    // HTTP/1.0 may omit Host: it is forwarded with one added.
+    let out = send_raw(port, c, &format!("GET /old HTTP/1.0\r\n{}\r\n", cookie));
+    assert!(out.contains("BACKEND saw target=/old"), "{}", &out[..out.len().min(120)]);
 }
 
 #[test]
@@ -329,6 +358,7 @@ fn an_unreachable_backend_is_a_502_not_a_hang() {
         upstream: Upstream::new(&dead, COOKIE).unwrap(),
         proxy: true,
         max_body: 64 * 1024,
+        memory: Memory::default(),
     });
     let a = Arc::clone(&app);
     thread::spawn(move || {
@@ -358,3 +388,84 @@ fn a_page_with_many_assets_does_not_revoke_the_pass() {
     }
 }
 
+
+#[test]
+fn a_passless_request_body_is_not_buffered() {
+    // Without a pass, a large body is never read: the challenge comes back at
+    // once instead of after the gate waited for (and held) the whole body.
+    let (port, _app) = start();
+    let t0 = std::time::Instant::now();
+    let out = send_raw(
+        port,
+        0x3535_3535,
+        "POST /upload HTTP/1.1\r\nHost: t.onion\r\nContent-Length: 60000\r\n\r\nonly a few bytes",
+    );
+    assert!(is_challenge(&out), "{}", &out[..out.len().min(120)]);
+    assert!(t0.elapsed() < Duration::from_secs(3), "took {:?}", t0.elapsed());
+}
+
+#[test]
+fn a_large_body_with_a_valid_pass_is_forwarded() {
+    let (port, app) = start();
+    let c = 0x3636_3636;
+    let pass = pass_for(port, app.as_ref(), c);
+    let body = "a".repeat(50_000);
+    let r = send(port, c, "POST", "/big", Some(&pass), Some(&body));
+    assert!(r.starts_with("HTTP/1.1 200") && r.contains(&body), "{}", &r[..r.len().min(120)]);
+}
+
+#[test]
+fn a_spent_memory_budget_is_a_503_not_an_oom() {
+    // A budget too small for any forwarded request: the gate itself (challenge,
+    // verify) still works, and forwarding answers 503 instead of buffering.
+    let (port, app) = start_custom(false, Memory::new(100));
+    let c = 0x3737_3737;
+    let pass = pass_for(port, app.as_ref(), c);
+    let get = send(port, c, "GET", "/", Some(&pass), None);
+    assert!(get.starts_with("HTTP/1.1 503") && !get.contains("BACKEND"), "{}", &get[..get.len().min(120)]);
+    let post = send(port, c, "POST", "/", Some(&pass), Some(&"x".repeat(80)));
+    assert!(post.starts_with("HTTP/1.1 503") && !post.contains("BACKEND"), "{}", &post[..post.len().min(120)]);
+    assert_budget_released(&app);
+}
+
+/// The server thread gives its reservation back after closing the connection
+/// (which may drain for up to 500 ms), so the client can be done first.
+fn assert_budget_released(app: &App) {
+    let t0 = std::time::Instant::now();
+    while app.memory.used() != 0 && t0.elapsed() < Duration::from_secs(3) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(app.memory.used(), 0, "every reservation is given back");
+}
+
+#[test]
+fn a_declared_body_that_never_arrives_reserves_nothing() {
+    // Budget 4096. A pass holder declares a 1900-byte body and sends none of it:
+    // were it reserved upfront (2 x 1900), the next forwarded request would not
+    // fit and get a 503.
+    let (port, app) = start_custom(false, Memory::new(4096));
+    let c = 0x3939_3939;
+    let pass = pass_for(port, app.as_ref(), c);
+    let mut hanging = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+    let head = format!(
+        "{}POST /upload HTTP/1.1\r\nHost: t.onion\r\nCookie: {}={}\r\nContent-Length: 1900\r\n\r\n",
+        proxy_line(c),
+        COOKIE,
+        pass
+    );
+    hanging.write_all(head.as_bytes()).unwrap();
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(app.memory.used(), 0, "nothing arrived, nothing is held");
+    let r = send(port, c, "GET", "/ok", Some(&pass), None);
+    assert!(r.starts_with("HTTP/1.1 200") && r.contains("target=/ok"), "{}", &r[..r.len().min(120)]);
+    drop(hanging);
+}
+
+#[test]
+fn head_replies_from_the_gate_have_no_body() {
+    let (port, _app) = start();
+    let out = send(port, 0x3838_3838, "HEAD", "/", None, None);
+    assert!(out.starts_with("HTTP/1.1 200"), "{}", &out[..out.len().min(80)]);
+    assert!(out.ends_with("\r\n\r\n"), "a HEAD response must stop after the headers");
+    assert!(out.contains("Content-Length: ") && !out.contains("Content-Length: 0\r\n"), "it keeps the GET length");
+}

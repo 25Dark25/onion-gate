@@ -74,7 +74,14 @@ Forwarded requests keep their method, path, query and headers, **except**:
   `Upgrade`, …) are dropped;
 - the `onion_gate_pass` cookie is stripped from the `Cookie` header (other
   cookies pass through);
-- `Content-Length` is recomputed and `Connection: close` is forced.
+- headers that claim to describe the client or an earlier proxy are dropped:
+  `Forwarded`, every `X-Forwarded-*`, `X-Real-IP`, `X-Client-IP`,
+  `True-Client-IP` and similar, plus `Proxy` (httpoxy). onion-gate is the first
+  hop and connects from loopback, so a backend that trusts these from a local
+  proxy would otherwise believe whatever the visitor wrote. Names are matched
+  with `_` read as `-`, as CGI and PHP do;
+- `Content-Length` is recomputed (and sent as `0` for an empty `POST`, `PUT`
+  or `PATCH`) and `Connection: close` is forced.
 
 onion-gate **adds nothing** about the visitor — no `X-Forwarded-For`, no client
 address. The backend learns only what the request itself carried. That is
@@ -88,7 +95,9 @@ deliberate: the whole point is that the visitor stays anonymous.
 - A backend that listens on a loopback address (`127.0.0.1` or `::1`).
 - For per-circuit limits: tor with `HiddenServiceExportCircuitID haproxy`
   (see [`deploy/torrc.example`](deploy/torrc.example)). Without it the gate still
-  works, but can only apply the per-pass limit.
+  works, but can only apply the per-pass limit: challenge generation (CPU) is
+  then unlimited, so run without `--proxy-protocol` for local tests only (the
+  binary warns at startup).
 
 ## Build and run
 
@@ -112,7 +121,7 @@ Flags:
 | Flag | Meaning |
 | --- | --- |
 | `[port]` | Port to listen on (loopback only). Default `8088`. |
-| `--upstream=HOST:PORT` | **Required.** The backend to protect. Must resolve to loopback. |
+| `--upstream=HOST:PORT` | **Required.** The backend to protect. Must resolve to loopback, and not to onion-gate's own port. |
 | `--proxy-protocol` | Require tor's PROXY v1 line on every connection (production). |
 | `--max-body=BYTES` | Cap on request body size (default 1 MiB). |
 
@@ -191,6 +200,8 @@ it.
 | Request head / target cap | 16 KiB / 2 KiB | `MAX_HEAD`, `MAX_TARGET` in `src/http.rs` |
 | Read deadlines (head / body) | 8 s / 60 s | `READ_DEADLINE`, `BODY_DEADLINE` in `src/http.rs` |
 | Upstream response cap / timeouts | 8 MiB / 5 s connect, 30 s I/O | top of `src/upstream.rs` |
+| Buffered bytes, all connections | 128 MiB | `MAX_BUFFERED` in `src/limit.rs` |
+| Time to deliver one response | 300 s | `SEND_DEADLINE` in `src/http.rs` |
 | Image difficulty | — | constants at the top of `src/captcha.rs` |
 | CAPTCHA page text and style | — | `src/html.rs` |
 
@@ -224,11 +235,13 @@ Guarantees (as far as the code goes):
   same-origin absolute path and stored server-side, never taken from a header
   the client controls.
 - **Strict HTTP:** one request per connection, `Connection: close`, no keep-alive
-  or pipelining (no request smuggling), chunked request bodies rejected, size
-  and time limits throughout.
+  or pipelining (no request smuggling), chunked request bodies rejected, header
+  names must be tokens, exactly one `Host` (HTTP/1.1), size and time limits
+  throughout.
 - **Loopback only:** listens on `127.0.0.1`; the upstream must be loopback too.
 - **No visitor data added** to forwarded requests; the pass cookie is stripped.
-- **Bounded memory** in every store.
+- **Bounded memory** in every store and for all buffered bodies together, and
+  no request body buffered (beyond 1 KiB) for a visitor without a valid pass.
 
 ## Limitations
 
@@ -241,16 +254,30 @@ Be honest with yourself about what this is:
   author only. Read it before you trust it.
 - **Passes are transferable.** A pass is a bearer cookie, not bound to a circuit;
   its budget and lifetime limit how much a shared pass is worth, no more.
-- **Whole request/response buffered in memory**, each capped. No streaming, no
-  WebSockets (`101 Switching Protocols` is refused), no HTTP/2, no large
-  uploads/downloads beyond the caps. Raise `--max-body` and the response cap if
-  you need more, at a memory cost.
+- **Whole request/response buffered in memory**, each capped, and all of them
+  together capped by a global budget (`MAX_BUFFERED`, 128 MiB): past it,
+  forwarded requests get `503` until memory is freed, instead of the process
+  running out of memory. No streaming, no WebSockets (`101 Switching
+  Protocols` is refused), no HTTP/2, no large uploads/downloads beyond the
+  caps. Raise `--max-body`, the response cap and the budget if you need more,
+  at a memory cost.
+- **Slow readers hold their response.** A visitor with a valid pass who reads
+  very slowly keeps its buffered response, and its share of the budget, for up
+  to `SEND_DEADLINE` (300 s). The per-circuit connection limit bounds how much
+  one circuit can hold this way, not how much many circuits can. A site that
+  serves large files to untrusted visitors should keep them out of reach of
+  the gate or lower the response cap.
 - **Strict about the backend too.** A response with a `Transfer-Encoding` other
-  than plain `chunked`, conflicting `Content-Length`s, or non-UTF-8 header bytes
-  is answered with `502` rather than relayed.
+  than plain `chunked`, conflicting `Content-Length`s, a header name that is not
+  a token, or control bytes or non-UTF-8 bytes in the status line or a header is
+  answered with `502` rather than relayed.
 - **A sub-request without a pass gets the challenge page.** If a pass expires
   while a page is loading, an image or stylesheet request receives HTML instead
   and shows as broken until the next navigation, which shows the CAPTCHA.
+- **Without a valid pass, a request body over 1 KiB is never read** (so nobody
+  can make the gate buffer uploads before passing the CAPTCHA). If a pass
+  expires while the visitor is uploading a large form, the browser may show a
+  connection error instead of the challenge; reloading the page shows it.
 - **One backend, loopback only.** No load balancing, no TLS termination, no
   virtual hosts. Put those in your backend or in front of tor.
 - **Network-level DoS** is tor's job (its PoW and introduction defenses) plus the

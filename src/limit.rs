@@ -9,7 +9,7 @@
 //!  - challenges generated per circuit (token bucket: stops CPU abuse and
 //!    filling the challenge store),
 //!  - site pages served per circuit (token bucket: stops one circuit from
-//!    hammering the site with several passes; see main.rs for what happens
+//!    hammering the site with several passes; see `gated` in lib.rs for what happens
 //!    when it runs out).
 //!
 //! To take the service down, an attacker needs many circuits, and every new
@@ -17,6 +17,7 @@
 //! Policy: when in doubt, deny (fail-closed).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -213,9 +214,116 @@ impl Limiter {
     }
 }
 
+// ------------------------------------------------------------ memory budget
+
+/// Request and response bytes buffered at once, across all connections. Every
+/// forwarded request and its response are held in memory (see upstream.rs);
+/// without a global bound, a few visitors with a valid pass fetching large
+/// files in parallel could exhaust the process's memory. Over the budget, the
+/// visitor gets a 503 instead.
+pub const MAX_BUFFERED: usize = 128 * 1024 * 1024;
+
+/// A shared byte budget. Reservations give their bytes back when dropped.
+pub struct Memory {
+    used: AtomicUsize,
+    max: usize,
+}
+
+impl Default for Memory {
+    fn default() -> Self {
+        Self::new(MAX_BUFFERED)
+    }
+}
+
+impl Memory {
+    pub fn new(max: usize) -> Memory {
+        Memory { used: AtomicUsize::new(0), max }
+    }
+
+    /// Reserves `n` bytes. None = the budget would be exceeded.
+    pub fn reserve(&self, n: usize) -> Option<Reservation<'_>> {
+        let mut r = Reservation { mem: self, bytes: 0 };
+        if r.grow(n) {
+            Some(r)
+        } else {
+            None
+        }
+    }
+
+    /// Bytes currently reserved.
+    pub fn used(&self) -> usize {
+        self.used.load(Ordering::SeqCst)
+    }
+}
+
+/// Bytes held from a `Memory` budget; released on drop.
+pub struct Reservation<'a> {
+    mem: &'a Memory,
+    bytes: usize,
+}
+
+impl Reservation<'_> {
+    /// Adds `n` bytes to the reservation. false = over budget (nothing added).
+    pub fn grow(&mut self, n: usize) -> bool {
+        // An explicit CAS loop: `fetch_update` is deprecated in recent Rust and
+        // its replacement does not exist in the minimum supported version.
+        let used = &self.mem.used;
+        let mut cur = used.load(Ordering::SeqCst);
+        loop {
+            let next = match cur.checked_add(n) {
+                Some(t) if t <= self.mem.max => t,
+                _ => return false,
+            };
+            match used.compare_exchange_weak(cur, next, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => {
+                    self.bytes += n;
+                    return true;
+                }
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Bytes this reservation holds.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Gives back everything above `n` bytes.
+    pub fn shrink_to(&mut self, n: usize) {
+        if n < self.bytes {
+            self.mem.used.fetch_sub(self.bytes - n, Ordering::SeqCst);
+            self.bytes = n;
+        }
+    }
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        self.mem.used.fetch_sub(self.bytes, Ordering::SeqCst);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_budget_is_shared_and_released() {
+        let m = Memory::new(100);
+        let mut a = m.reserve(60).expect("fits");
+        assert!(m.reserve(41).is_none(), "over budget");
+        let b = m.reserve(40).expect("exactly fits");
+        assert_eq!(m.used(), 100);
+        assert!(!a.grow(1));
+        drop(b);
+        assert!(a.grow(30));
+        a.shrink_to(10);
+        assert_eq!(m.used(), 10);
+        drop(a);
+        assert_eq!(m.used(), 0);
+        assert!(m.reserve(usize::MAX).is_none(), "no overflow");
+    }
 
     #[test]
     fn connection_limit_per_circuit() {

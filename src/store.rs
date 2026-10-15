@@ -5,7 +5,7 @@
 //!    attempt, whether it succeeds or fails. No retries on the same token.
 //!  - Strict expiry (CHALLENGE_TTL + GRACE), checked on every use.
 //!  - Each challenge carries the path to return to once the CAPTCHA is passed.
-//!    It is the sanitized request path (see `gate::safe_return_path`): always a
+//!    It is the sanitized request path (see `safe_return_path` in lib.rs): always a
 //!    same-origin absolute path, so it can never become an open redirect. It is
 //!    stored here, bound to the token, never echoed through the client.
 //!  - A pass dies after PASS_IDLE without use or PASS_MAX after it was issued,
@@ -50,7 +50,7 @@ pub struct Pending {
     /// Rounds still to pass, including this challenge's (>= 1).
     pub rounds_left: u8,
     /// Where to send the visitor after the last round: a sanitized, same-origin
-    /// absolute path (see `gate::safe_return_path`).
+    /// absolute path (see `safe_return_path` in lib.rs).
     pub ret: String,
     expires: Instant,
 }
@@ -223,6 +223,12 @@ impl Store {
             p.last_used = now;
         }
         PassUse::Ok
+    }
+
+    /// Is the pass registered and alive? Charges nothing and renews nothing.
+    pub fn pass_alive(&self, token: &Token) -> bool {
+        let now = Instant::now();
+        self.lock().passes.get(token).is_some_and(|p| p.alive(now))
     }
 
     /// Revokes a pass (e.g. its circuit went over the page limit).
@@ -445,7 +451,9 @@ mod tests {
         let s = Store::new();
         assert!(s.add_pass(T1));
         assert!(s.add_pass(T2));
+        assert!(s.pass_alive(&T1));
         s.revoke_pass(&T1);
+        assert!(!s.pass_alive(&T1));
         assert_eq!(s.use_pass(&T1), PassUse::Invalid);
         assert_eq!(s.use_pass(&T2), PassUse::Ok);
     }

@@ -25,7 +25,7 @@ pub mod store;
 pub mod upstream;
 
 use http::{HttpError, Reply, Request};
-use limit::Limiter;
+use limit::{Limiter, Memory, Reservation};
 use rng::Rng;
 use std::net::TcpStream;
 use store::{PassUse, Store, Token};
@@ -40,6 +40,12 @@ pub const COOKIE: &str = "onion_gate_pass";
 pub const GATE_PREFIX: &str = "/__gate/";
 /// Where the challenge form posts (inside GATE_PREFIX).
 pub const VERIFY_PATH: &str = "/__gate/verify";
+
+/// Largest body read from a request that cannot be forwarded (no live pass, or
+/// the gate's own namespace). The verify form is under 100 bytes. Anything
+/// larger is not read at all, so a visitor without a pass cannot make the gate
+/// buffer `max_body` bytes per connection.
+const GATE_MAX_BODY: usize = 1024;
 
 const MSG_FAIL: &str = "Wrong or expired. Try this new image.";
 const MSG_NEXT: &str = "Correct. One more.";
@@ -58,13 +64,16 @@ pub struct App {
     pub proxy: bool,
     /// Largest request body accepted (and thus forwarded).
     pub max_body: usize,
+    /// Global budget for buffered request and response bytes.
+    pub memory: Memory,
 }
 
 /// What `route` produces: either a page the gate generated, or already-framed
-/// bytes from the upstream to relay verbatim.
-pub enum Out {
+/// bytes from the upstream to relay verbatim (with their share of the memory
+/// budget, released once they are sent).
+pub enum Out<'a> {
     Reply(Reply),
-    Raw(Vec<u8>),
+    Raw(Vec<u8>, Reservation<'a>),
 }
 
 // --------------------------------------------------------------- return path
@@ -120,8 +129,6 @@ fn challenge_allowed(app: &App, circuit: Option<u32>) -> bool {
 /// Handles one connection end to end: the PROXY line (proxy mode), the
 /// per-circuit connection slot, one request, and the reply.
 pub fn serve_connection(stream: &mut TcpStream, app: &App) {
-    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
-
     let (circuit, initial) = if app.proxy {
         match http::read_proxy(stream) {
             Ok((c, rest)) => (Some(c), rest),
@@ -146,22 +153,43 @@ pub fn serve_connection(stream: &mut TcpStream, app: &App) {
         None => None,
     };
 
-    match http::read_request(stream, initial, app.max_body) {
-        Ok(req) => match route(&req, circuit, app) {
-            Out::Reply(r) => http::send(stream, &r),
-            Out::Raw(bytes) => http::send_raw(stream, &bytes),
-        },
-        Err(e) => {
-            if let Some(reply) = error_reply(&e) {
-                http::send(stream, &reply);
-            }
+    // The body's memory is charged as it arrives and held until the reply has
+    // been sent.
+    let mut body_mem: Option<Reservation<'_>> = None;
+    let mut head_request = false;
+    let req = http::read_head(stream, initial).and_then(|p| {
+        head_request = p.req.method == "HEAD";
+        let cl = p.content_length.unwrap_or(0);
+        if may_forward(&p.req, app) {
+            let held = body_mem.insert(app.memory.reserve(0).ok_or(HttpError::Busy)?);
+            p.read_body(stream, app.max_body, Some(held))
+        } else if cl <= GATE_MAX_BODY {
+            p.read_body(stream, GATE_MAX_BODY, None)
+        } else {
+            Ok(p.skip_body())
         }
+    });
+    match req {
+        Ok(req) => match route(&req, circuit, app) {
+            Out::Reply(r) if head_request => http::send_head(stream, &r),
+            Out::Reply(r) => http::send(stream, &r),
+            // A relayed HEAD response is already body-less (upstream.rs).
+            Out::Raw(bytes, _held) => http::send_raw(stream, &bytes),
+        },
+        Err(e) => match error_reply(&e) {
+            Some(reply) if head_request => http::send_head(stream, &reply),
+            Some(reply) => http::send(stream, &reply),
+            None => {}
+        },
     }
     http::close(stream);
 }
 
 fn error_reply(e: &HttpError) -> Option<Reply> {
     let status = e.status()?;
+    if status == 503 {
+        return Some(Reply::page(503, html::message(MSG_BUSY)));
+    }
     let mut r = Reply::page(status, html::message(&format!("Error {}", status)));
     if status == 405 {
         r.extra.push(("Allow", "GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS".to_string()));
@@ -169,10 +197,25 @@ fn error_reply(e: &HttpError) -> Option<Reply> {
     Some(r)
 }
 
+fn in_gate_namespace(path: &str) -> bool {
+    path == GATE_PREFIX.trim_end_matches('/') || path.starts_with(GATE_PREFIX)
+}
+
+/// The pass cookie of a request, if it is well-formed.
+fn presented_pass(req: &Request) -> Option<Option<Token>> {
+    let v = req.cookie.as_deref().and_then(|c| http::cookie_get(c, COOKIE))?;
+    Some(store::from_hex(v))
+}
+
+/// Could this request reach the backend? Only then is its whole body worth
+/// reading. Checked again (and charged) when it is routed.
+fn may_forward(req: &Request, app: &App) -> bool {
+    !in_gate_namespace(&req.path) && matches!(presented_pass(req), Some(Some(t)) if app.store.pass_alive(&t))
+}
+
 /// Routes one parsed request.
-pub fn route(req: &Request, circuit: Option<u32>, app: &App) -> Out {
-    let path = req.path.as_str();
-    if path == GATE_PREFIX.trim_end_matches('/') || path.starts_with(GATE_PREFIX) {
+pub fn route<'a>(req: &Request, circuit: Option<u32>, app: &'a App) -> Out<'a> {
+    if in_gate_namespace(&req.path) {
         Out::Reply(gate_route(req, circuit, app))
     } else {
         gated(req, circuit, app)
@@ -204,7 +247,7 @@ fn gate_route(req: &Request, circuit: Option<u32>, app: &App) -> Reply {
 /// Everything that is not the gate's namespace: the backend, behind the gate.
 /// Without a valid pass the answer is always a challenge (the backend is never
 /// reached, and nothing about it is revealed).
-fn gated(req: &Request, circuit: Option<u32>, app: &App) -> Out {
+fn gated<'a>(req: &Request, circuit: Option<u32>, app: &'a App) -> Out<'a> {
     // Where to send the visitor after they pass. A non-GET cannot be replayed,
     // so it returns to "/".
     let ret = if req.is_get() {
@@ -213,13 +256,10 @@ fn gated(req: &Request, circuit: Option<u32>, app: &App) -> Out {
         "/".to_string()
     };
 
-    let presented = req.cookie.as_deref().and_then(|c| http::cookie_get(c, COOKIE));
-    let pass = match presented {
+    let pass = match presented_pass(req) {
         None => return Out::Reply(gate(app, circuit, "", ret, false)),
-        Some(v) => match store::from_hex(v) {
-            Some(t) => t,
-            None => return Out::Reply(gate(app, circuit, "", ret, true)),
-        },
+        Some(None) => return Out::Reply(gate(app, circuit, "", ret, true)),
+        Some(Some(t)) => t,
     };
     match app.store.use_pass(&pass) {
         PassUse::Ok => {}
@@ -235,8 +275,9 @@ fn gated(req: &Request, circuit: Option<u32>, app: &App) -> Out {
     }
 
     // Valid pass: forward to the backend.
-    match app.upstream.forward(req) {
-        Ok(bytes) => Out::Raw(bytes),
+    match app.upstream.forward(req, &app.memory) {
+        Ok((bytes, held)) => Out::Raw(bytes, held),
+        Err(upstream::ProxyError::Busy) => Out::Reply(Reply::page(503, html::message(MSG_BUSY))),
         Err(e) => Out::Reply(Reply::page(e.status(), html::message(MSG_GATEWAY))),
     }
 }

@@ -146,6 +146,11 @@ fn parse_head(raw: &[u8], head_only: bool) -> Result<Option<Head<'_>>, ProxyErro
         let body = &rest[end + 4..];
         let mut lines = head.split("\r\n");
         let status_line = lines.next().ok_or(ProxyError::BadResponse)?;
+        // The reason phrase is relayed to the visitor: a lone CR/LF in it would
+        // split the response (inject headers), so the whole line must be clean.
+        if !http::is_field_text(status_line) {
+            return Err(ProxyError::BadResponse);
+        }
         let code = parse_status(status_line).ok_or(ProxyError::BadResponse)?;
         if code == 101 {
             return Err(ProxyError::BadResponse); // no protocol switching (WebSockets)
@@ -161,11 +166,12 @@ fn parse_head(raw: &[u8], head_only: bool) -> Result<Option<Head<'_>>, ProxyErro
         let mut named: Vec<String> = Vec::new();
         let mut parsed: Vec<(&str, &str)> = Vec::with_capacity(lines.len());
         for line in lines {
-            if line.contains('\r') || line.contains('\n') || line.starts_with(' ') || line.starts_with('\t') {
-                return Err(ProxyError::BadResponse); // response splitting / obs-fold
+            // A lone CR/LF or a control byte (response splitting), or obs-fold.
+            if !http::is_field_text(line) || line.starts_with(' ') || line.starts_with('\t') {
+                return Err(ProxyError::BadResponse);
             }
             let (name, value) = line.split_once(':').ok_or(ProxyError::BadResponse)?;
-            if name.is_empty() || name.bytes().any(|b| b == b' ' || b == b'\t') {
+            if !http::is_token(name) {
                 return Err(ProxyError::BadResponse);
             }
             let value = value.trim_matches(|c: char| c == ' ' || c == '\t');
@@ -580,6 +586,11 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n",       // not plain chunked
             b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort",                         // truncated
             b"HTTP/1.1 2000 OK\r\n\r\n",                                                    // bad status
+            b"HTTP/1.1 200 OK\nSet-Cookie: evil=1\r\nContent-Length: 0\r\n\r\n",     // lone LF in the status line
+            b"HTTP/1.1 200 OK\rSet-Cookie: evil=1\r\nContent-Length: 0\r\n\r\n",     // lone CR in the status line
+            b"HTTP/1.1 200 O\x00K\r\nContent-Length: 0\r\n\r\n",                    // control byte in the reason
+            b"HTTP/1.1 200 OK\r\nX: a\x00b\r\nContent-Length: 0\r\n\r\n",          // control byte in a value
+            b"HTTP/1.1 200 OK\r\nX(y): 1\r\nContent-Length: 0\r\n\r\n",            // not a token name
         ];
         for raw in bad {
             assert!(frame_response(raw, false).is_err(), "accepted {:?}", String::from_utf8_lossy(raw));

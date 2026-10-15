@@ -246,8 +246,9 @@ Be honest with yourself about what this is:
   uploads/downloads beyond the caps. Raise `--max-body` and the response cap if
   you need more, at a memory cost.
 - **Strict about the backend too.** A response with a `Transfer-Encoding` other
-  than plain `chunked`, conflicting `Content-Length`s, or non-UTF-8 header bytes
-  is answered with `502` rather than relayed.
+  than plain `chunked`, conflicting `Content-Length`s, a header name that is not
+  a token, or control bytes or non-UTF-8 bytes in the status line or a header is
+  answered with `502` rather than relayed.
 - **A sub-request without a pass gets the challenge page.** If a pass expires
   while a page is loading, an image or stylesheet request receives HTML instead
   and shows as broken until the next navigation, which shows the CAPTCHA.

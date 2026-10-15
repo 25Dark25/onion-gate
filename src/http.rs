@@ -330,6 +330,23 @@ pub fn read_request(stream: &mut TcpStream, initial: Vec<u8>, max_body: usize) -
 
 // ------------------------------------------------------------ parsing helpers
 
+/// A header field name: a non-empty RFC 9110 token (letters, digits and
+/// ``!#$%&'*+-.^_`|~``). Anything else (spaces, separators, controls) is refused
+/// rather than forwarded for a backend to interpret its own way.
+pub fn is_token(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
+/// Text allowed in a header value or a reason phrase: no control bytes except
+/// tab (so no CR or LF that could start a new line), no DEL. Bytes >= 0x80
+/// (obs-text) are allowed.
+pub fn is_field_text(s: &str) -> bool {
+    s.bytes().all(|b| b == b'\t' || (b >= 0x20 && b != 0x7F))
+}
+
 /// Value of `key` in an application/x-www-form-urlencoded body.
 /// None if missing or present more than once (no ambiguity).
 /// Does not decode %XX: the expected fields (hex and digits) never need it.
@@ -515,6 +532,18 @@ mod tests {
         assert_eq!(cookie_without("pass=xyz; pass=abc", "pass"), None);
         assert_eq!(cookie_without("a=1", "pass").as_deref(), Some("a=1"));
         assert_eq!(cookie_without("", "pass"), None);
+    }
+
+    #[test]
+    fn token_and_field_text() {
+        assert!(is_token("Content-Type") && is_token("X_Custom") && is_token("a!#$%&'*+-.^_`|~9"));
+        for bad in ["", "X Y", "X(y)", "X:y", "X\"y", "X/y", "X\u{e9}", "X\ty"] {
+            assert!(!is_token(bad), "{:?}", bad);
+        }
+        assert!(is_field_text("text/html; charset=utf-8") && is_field_text("a\tb") && is_field_text("caf\u{e9}"));
+        for bad in ["a\rb", "a\nb", "a\x00b", "a\x7fb", "a\x1bb"] {
+            assert!(!is_field_text(bad), "{:?}", bad);
+        }
     }
 
     #[test]

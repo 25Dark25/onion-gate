@@ -219,6 +219,9 @@ src/html.rs      the CAPTCHA page and error pages, base64
 src/png.rs       PNG encoder
 src/rng.rs       randomness from /dev/urandom
 tests/flow.rs    end-to-end tests over real sockets (gate, forwarding, limits, no open redirect)
+examples/        local test harness: a test backend and a stand-in for tor's PROXY line
+scripts/         harness.sh: automated checks against the real binaries, and a stack for a browser
+docs/TESTING.md  how to test: cargo test, the harness, and the Tor Browser (Safest) checklist
 deploy/          example torrc and a hardened systemd unit
 .github/         CI (tests on Linux and macOS, MSRV and stable) and Dependabot
 ```
@@ -299,9 +302,10 @@ This project was developed with the help of Claude (Anthropic) and directed, tes
 cargo test --offline                              # unit + end-to-end tests
 cargo clippy --offline --all-targets -- -D warnings
 cargo build --release --offline
+scripts/harness.sh check                          # the real binaries over sockets (needs curl >= 8.2)
 ```
 
-CI runs the same on Linux and macOS with Rust 1.82 (the minimum supported version) and the latest stable, and fails if the crate gains any dependency.
+CI runs the same on Linux and macOS with Rust 1.82 (the minimum supported version) and the latest stable (the harness on Linux only), and fails if the crate gains any dependency. [docs/TESTING.md](docs/TESTING.md) explains the harness and has the manual checklist for Tor Browser at the Safest level.
 
 ## Security
 

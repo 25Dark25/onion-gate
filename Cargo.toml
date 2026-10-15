@@ -25,6 +25,16 @@ path = "src/lib.rs"
 name = "onion-gate"
 path = "src/main.rs"
 
+# Local test harness (scripts/harness.sh, docs/TESTING.md). std and this crate
+# only; `test = true` makes `cargo test` run their unit tests too.
+[[example]]
+name = "test_backend"
+test = true
+
+[[example]]
+name = "circuit_proxy"
+test = true
+
 [profile.release]
 opt-level = "z"     # minimum size
 lto = true

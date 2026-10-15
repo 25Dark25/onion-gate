@@ -47,6 +47,11 @@ jobs:
           fi
           test "$(grep -c '^\[\[package\]\]' Cargo.lock)" = 1
       - run: cargo test --locked --offline
+      # The local harness against a real gate process, over sockets. Linux only:
+      # it needs curl >= 8.2 (--haproxy-clientip), which the Linux image has.
+      - name: Harness checks
+        if: runner.os == 'Linux'
+        run: scripts/harness.sh check
       - name: Clippy (no warnings)
         if: matrix.rust == 'stable'
         run: cargo clippy --locked --offline --all-targets -- -D warnings

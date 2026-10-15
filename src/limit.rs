@@ -265,17 +265,23 @@ pub struct Reservation<'a> {
 impl Reservation<'_> {
     /// Adds `n` bytes to the reservation. false = over budget (nothing added).
     pub fn grow(&mut self, n: usize) -> bool {
-        let ok = self
-            .mem
-            .used
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |u| {
-                u.checked_add(n).filter(|&t| t <= self.mem.max)
-            })
-            .is_ok();
-        if ok {
-            self.bytes += n;
+        // An explicit CAS loop: `fetch_update` is deprecated in recent Rust and
+        // its replacement does not exist in the minimum supported version.
+        let used = &self.mem.used;
+        let mut cur = used.load(Ordering::SeqCst);
+        loop {
+            let next = match cur.checked_add(n) {
+                Some(t) if t <= self.mem.max => t,
+                _ => return false,
+            };
+            match used.compare_exchange_weak(cur, next, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => {
+                    self.bytes += n;
+                    return true;
+                }
+                Err(actual) => cur = actual,
+            }
         }
-        ok
     }
 
     /// Bytes this reservation holds.

@@ -6,10 +6,11 @@
 //!    keep-alive, no pooling, no pipelining.
 //!  - The request is forwarded verbatim (method, target, headers, body) EXCEPT:
 //!    hop-by-hop headers are dropped, the gate's own pass cookie is stripped
-//!    from the `Cookie` header, `Content-Length` is recomputed, and
-//!    `Connection: close` is forced. Nothing about the visitor is added — no
-//!    `X-Forwarded-For`, no client address — so the backend learns nothing the
-//!    gate did not already strip.
+//!    from the `Cookie` header, client-supplied forwarding headers
+//!    (`X-Forwarded-*`, `Forwarded`, `X-Real-IP`, …) and `Proxy` are dropped,
+//!    `Content-Length` is recomputed, and `Connection: close` is forced.
+//!    Nothing about the visitor is added — no `X-Forwarded-For`, no client
+//!    address — so the backend learns nothing the gate did not already strip.
 //!  - The upstream must be a loopback address (checked at startup): the gate is
 //!    meant to sit in front of a backend on the same host.
 //!  - The whole request and response bodies are buffered in memory, each capped
@@ -297,7 +298,36 @@ fn read_response(stream: &mut TcpStream, head_only: bool) -> Result<Vec<u8>, Pro
 /// Request headers never forwarded besides the hop-by-hop ones: the length is
 /// recomputed, and the gate already holds the whole body, so `Expect:
 /// 100-continue` must not reach the backend (its interim 100 would be wasted).
-const DROP_REQUEST: &[&str] = &["content-length", "expect"];
+///
+/// The rest claim to describe the client or an earlier proxy. The gate is the
+/// first hop and connects from loopback, so a backend that trusts them from a
+/// local proxy would believe whatever the visitor wrote in them (an address
+/// allowlist or a per-IP limit fooled). `proxy` is httpoxy: CGI turns it into
+/// the HTTP_PROXY variable. Any header starting with `x-forwarded-` goes too.
+const DROP_REQUEST: &[&str] = &[
+    "content-length",
+    "expect",
+    "forwarded",
+    "x-real-ip",
+    "x-client-ip",
+    "true-client-ip",
+    "x-cluster-client-ip",
+    "x-originating-ip",
+    "client-ip",
+    "cf-connecting-ip",
+    "fastly-client-ip",
+    "proxy",
+];
+
+/// Lowercase, with `_` read as `-`: CGI, PHP and others map both to the same
+/// variable, so `X_Forwarded_For` must be dropped like `X-Forwarded-For`.
+fn normalized(name: &str) -> String {
+    name.to_ascii_lowercase().replace('_', "-")
+}
+
+fn dropped_request_header(lname: &str) -> bool {
+    HOP_BY_HOP.contains(&lname) || DROP_REQUEST.contains(&lname) || lname.starts_with("x-forwarded-")
+}
 
 /// Builds the request line + headers + body to send to the upstream.
 fn build_request(req: &Request, pass_cookie: &str) -> Vec<u8> {
@@ -306,13 +336,13 @@ fn build_request(req: &Request, pass_cookie: &str) -> Vec<u8> {
         .headers
         .iter()
         .filter(|(n, _)| n.eq_ignore_ascii_case("connection"))
-        .flat_map(|(_, v)| v.split(',').map(|t| t.trim().to_ascii_lowercase()))
+        .flat_map(|(_, v)| v.split(',').map(|t| normalized(t.trim())))
         .collect();
     let mut head = format!("{} {} HTTP/1.1\r\n", req.method, req.target);
     let mut has_host = false;
     for (name, value) in &req.headers {
-        let lname = name.to_ascii_lowercase();
-        if HOP_BY_HOP.contains(&lname.as_str()) || DROP_REQUEST.contains(&lname.as_str()) || named.contains(&lname) {
+        let lname = normalized(name);
+        if dropped_request_header(&lname) || named.contains(&lname) {
             continue;
         }
         if lname == "host" {
@@ -337,9 +367,10 @@ fn build_request(req: &Request, pass_cookie: &str) -> Vec<u8> {
     if !has_host {
         head.push_str("Host: localhost\r\n");
     }
-    // Recompute framing: our own Content-Length (only when there is a body) and
-    // a forced close.
-    if !req.body.is_empty() {
+    // Recompute framing: our own Content-Length (when there is a body, and
+    // always for the methods that normally carry one: some servers answer a
+    // POST without it with 411) and a forced close.
+    if !req.body.is_empty() || matches!(req.method.as_str(), "POST" | "PUT" | "PATCH") {
         head.push_str(&format!("Content-Length: {}\r\n", req.body.len()));
     }
     head.push_str("Connection: close\r\n\r\n");
@@ -696,6 +727,38 @@ mod tests {
         let r = req("GET", vec![("Connection", "X-Secret"), ("X-Secret", "1"), ("Host", "h")], b"");
         let wire = String::from_utf8(build_request(&r, "p")).unwrap();
         assert!(!wire.contains("X-Secret"));
+    }
+
+    #[test]
+    fn client_supplied_forwarding_headers_are_not_forwarded() {
+        // The gate connects from loopback, so a backend that trusts these from a
+        // local proxy would believe whatever the visitor wrote in them.
+        let r = req(
+            "GET",
+            vec![
+                ("Host", "h"),
+                ("X-Forwarded-For", "10.0.0.1"),
+                ("x_forwarded_for", "10.0.0.2"), // CGI/PHP read _ as -
+                ("X-Forwarded-Proto", "https"),
+                ("Forwarded", "for=10.0.0.3"),
+                ("X-Real-IP", "10.0.0.4"),
+                ("True-Client-IP", "10.0.0.5"),
+                ("Proxy", "http://evil:1"), // httpoxy: becomes HTTP_PROXY in CGI
+                ("X-Other", "kept"),
+            ],
+            b"",
+        );
+        let wire = String::from_utf8(build_request(&r, "p")).unwrap();
+        assert!(!wire.contains("10.0.0.") && !wire.contains("evil") && !wire.contains("https"), "{}", wire);
+        assert!(wire.contains("X-Other: kept\r\n"));
+    }
+
+    #[test]
+    fn an_empty_post_still_says_content_length_0() {
+        let wire = String::from_utf8(build_request(&req("POST", vec![("Host", "h")], b""), "p")).unwrap();
+        assert!(wire.contains("Content-Length: 0\r\n"), "{}", wire);
+        let wire = String::from_utf8(build_request(&req("GET", vec![("Host", "h")], b""), "p")).unwrap();
+        assert!(!wire.contains("Content-Length"), "{}", wire);
     }
 
     #[test]

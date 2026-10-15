@@ -74,7 +74,14 @@ Forwarded requests keep their method, path, query and headers, **except**:
   `Upgrade`, …) are dropped;
 - the `onion_gate_pass` cookie is stripped from the `Cookie` header (other
   cookies pass through);
-- `Content-Length` is recomputed and `Connection: close` is forced.
+- headers that claim to describe the client or an earlier proxy are dropped:
+  `Forwarded`, every `X-Forwarded-*`, `X-Real-IP`, `X-Client-IP`,
+  `True-Client-IP` and similar, plus `Proxy` (httpoxy). onion-gate is the first
+  hop and connects from loopback, so a backend that trusts these from a local
+  proxy would otherwise believe whatever the visitor wrote. Names are matched
+  with `_` read as `-`, as CGI and PHP do;
+- `Content-Length` is recomputed (and sent as `0` for an empty `POST`, `PUT`
+  or `PATCH`) and `Connection: close` is forced.
 
 onion-gate **adds nothing** about the visitor — no `X-Forwarded-For`, no client
 address. The backend learns only what the request itself carried. That is

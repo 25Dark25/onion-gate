@@ -16,12 +16,16 @@
 //!  - Nothing is written to disk; restarting the process invalidates everything.
 
 use crate::captcha::Secret;
+use crate::config::Limits;
 use crate::limit::Bucket;
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 pub type Token = [u8; 16];
+
+// Defaults of the configurable settings (config.rs takes its defaults from
+// here; the binary can override them).
 
 /// VISIBLE lifetime of a challenge: how long the page's progress bar lasts.
 pub const CHALLENGE_TTL: Duration = Duration::from_secs(30);
@@ -62,11 +66,20 @@ struct Pass {
 }
 
 impl Pass {
-    fn alive(&self, now: Instant) -> bool {
+    fn alive(&self, now: Instant, l: &PassLimits) -> bool {
         let age = now.checked_duration_since(self.issued).unwrap_or(Duration::ZERO);
         let idle = now.checked_duration_since(self.last_used).unwrap_or(Duration::ZERO);
-        age < PASS_MAX && idle < PASS_IDLE
+        age < l.max && idle < l.idle
     }
+}
+
+/// The pass settings in force (from the configuration).
+#[derive(Clone, Copy)]
+struct PassLimits {
+    idle: Duration,
+    max: Duration,
+    burst: f32,
+    per_sec: f32,
 }
 
 /// Result of presenting a pass with a page request.
@@ -89,19 +102,22 @@ struct Inner {
 impl Inner {
     /// Removes expired entries, at most once per second
     /// (stops an attacker from turning every request into an O(n) sweep).
-    fn purge(&mut self, now: Instant) {
+    fn purge(&mut self, now: Instant, l: &PassLimits) {
         match now.checked_duration_since(self.last_purge) {
             Some(d) if d >= PURGE_EVERY => {}
             _ => return,
         }
         self.last_purge = now;
         self.challenges.retain(|_, p| p.expires > now);
-        self.passes.retain(|_, p| p.alive(now));
+        self.passes.retain(|_, p| p.alive(now, l));
     }
 }
 
 pub struct Store {
     inner: Mutex<Inner>,
+    /// Visible lifetime of a challenge (GRACE is added on top).
+    ttl: Duration,
+    pass: PassLimits,
 }
 
 impl Default for Store {
@@ -111,13 +127,26 @@ impl Default for Store {
 }
 
 impl Store {
+    /// A store with the default settings.
     pub fn new() -> Store {
+        Self::with_limits(&Limits::default())
+    }
+
+    /// A store with the configured challenge lifetime and pass budget.
+    pub fn with_limits(l: &Limits) -> Store {
         Store {
             inner: Mutex::new(Inner {
                 challenges: HashMap::new(),
                 passes: HashMap::new(),
                 last_purge: Instant::now(),
             }),
+            ttl: l.challenge_ttl,
+            pass: PassLimits {
+                idle: l.pass_idle,
+                max: l.pass_max,
+                burst: l.pass_burst as f32,
+                per_sec: l.pass_per_sec(),
+            },
         }
     }
 
@@ -142,7 +171,7 @@ impl Store {
     ) -> bool {
         let mut g = self.lock();
         if g.challenges.len() >= MAX_CHALLENGES {
-            g.purge(now);
+            g.purge(now, &self.pass);
             if g.challenges.len() >= MAX_CHALLENGES {
                 return false;
             }
@@ -153,7 +182,7 @@ impl Store {
                 secret,
                 rounds_left,
                 ret,
-                expires: now + CHALLENGE_TTL + GRACE,
+                expires: now + self.ttl + GRACE,
             },
         );
         true
@@ -182,7 +211,7 @@ impl Store {
     fn add_pass_at(&self, now: Instant, token: Token) -> bool {
         let mut g = self.lock();
         if g.passes.len() >= MAX_PASSES {
-            g.purge(now);
+            g.purge(now, &self.pass);
             if g.passes.len() >= MAX_PASSES {
                 return false;
             }
@@ -192,7 +221,7 @@ impl Store {
             Pass {
                 issued: now,
                 last_used: now,
-                budget: Bucket::full(PASS_BURST, now),
+                budget: Bucket::full(self.pass.burst, now),
             },
         );
         true
@@ -211,11 +240,11 @@ impl Store {
             Some(p) => p,
             None => return PassUse::Invalid,
         };
-        if !p.alive(now) {
+        if !p.alive(now, &self.pass) {
             g.passes.remove(token);
             return PassUse::Invalid;
         }
-        if !p.budget.take(now, PASS_BURST, PASS_REFILL_PER_SEC) {
+        if !p.budget.take(now, self.pass.burst, self.pass.per_sec) {
             g.passes.remove(token);
             return PassUse::Exhausted;
         }
@@ -228,7 +257,7 @@ impl Store {
     /// Is the pass registered and alive? Charges nothing and renews nothing.
     pub fn pass_alive(&self, token: &Token) -> bool {
         let now = Instant::now();
-        self.lock().passes.get(token).is_some_and(|p| p.alive(now))
+        self.lock().passes.get(token).is_some_and(|p| p.alive(now, &self.pass))
     }
 
     /// Revokes a pass (e.g. its circuit went over the page limit).

@@ -26,9 +26,10 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 /// Largest upstream response the gate will buffer and relay.
-const MAX_RESPONSE: usize = 8 * 1024 * 1024;
+/// Defaults of the configurable response cap and I/O timeout (config.rs).
+pub const MAX_RESPONSE: usize = 8 * 1024 * 1024;
+pub const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Header names that belong to a single hop and must never be forwarded in
 /// either direction (RFC 9110 §7.6.1, plus the chunked framing header).
@@ -75,6 +76,9 @@ pub struct Upstream {
     addrs: Vec<SocketAddr>,
     /// The pass cookie name to strip from forwarded requests.
     pass_cookie: &'static str,
+    /// Largest response relayed, and the time the backend has to answer.
+    max_response: usize,
+    timeout: Duration,
 }
 
 impl Upstream {
@@ -87,11 +91,24 @@ impl Upstream {
         }
         if let Some(a) = addrs.iter().find(|a| !a.ip().is_loopback()) {
             return Err(format!(
-                "{}: upstream must be loopback (got {}); onion-gate only proxies a backend on the same host",
+                "{}: must be a loopback address (it resolves to {}); onion-gate only proxies a backend on the same host",
                 spec, a
             ));
         }
-        Ok(Upstream { addrs, pass_cookie })
+        Ok(Upstream {
+            addrs,
+            pass_cookie,
+            max_response: MAX_RESPONSE,
+            timeout: IO_TIMEOUT,
+        })
+    }
+
+    /// Sets the response cap and the backend timeout (defaults: MAX_RESPONSE,
+    /// IO_TIMEOUT).
+    pub fn with_limits(mut self, max_response: usize, timeout: Duration) -> Upstream {
+        self.max_response = max_response;
+        self.timeout = timeout;
+        self
     }
 
     /// Every address `--upstream` resolved to.
@@ -117,7 +134,7 @@ impl Upstream {
             .iter()
             .find_map(|a| TcpStream::connect_timeout(a, CONNECT_TIMEOUT).ok())
             .ok_or(ProxyError::Connect)?;
-        stream.set_write_timeout(Some(IO_TIMEOUT)).map_err(|_| ProxyError::Connect)?;
+        stream.set_write_timeout(Some(self.timeout)).map_err(|_| ProxyError::Connect)?;
         // No half-close: some servers read an early FIN as "client gave up".
         // `Connection: close` and an exact Content-Length frame the request.
         let sent = stream.write_all(&wire).and_then(|_| stream.flush()).is_ok();
@@ -126,7 +143,7 @@ impl Upstream {
         // Even if the write failed, the backend may have answered before closing
         // (e.g. a 413 for a body it did not want): relay that if it is there.
         let head_only = req.method == "HEAD";
-        let raw = match read_response(&mut stream, head_only, &mut held) {
+        let raw = match read_response(&mut stream, head_only, &mut held, self.max_response, self.timeout) {
             Ok(raw) => raw,
             Err(_) if !sent => return Err(ProxyError::Connect),
             Err(e) => return Err(e),
@@ -265,12 +282,18 @@ pub(crate) fn parse_head(raw: &[u8], head_only: bool) -> Result<Option<Head<'_>>
     }
 }
 
-/// Reads the upstream response into memory, bounded by MAX_RESPONSE, the
+/// Reads the upstream response into memory, bounded by `max_response`, the
 /// global memory budget and a total deadline. Stops as soon as the response is
 /// complete by its own framing, so a backend that keeps the connection open is
 /// not waited on until the timeout.
-fn read_response(stream: &mut TcpStream, head_only: bool, held: &mut Reservation<'_>) -> Result<Vec<u8>, ProxyError> {
-    let deadline = Instant::now() + IO_TIMEOUT;
+fn read_response(
+    stream: &mut TcpStream,
+    head_only: bool,
+    held: &mut Reservation<'_>,
+    max_response: usize,
+    timeout: Duration,
+) -> Result<Vec<u8>, ProxyError> {
+    let deadline = Instant::now() + timeout;
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
     let mut chunk = [0u8; 8192];
     // (where the body starts in `buf`, how it is delimited), once the head is in
@@ -287,7 +310,7 @@ fn read_response(stream: &mut TcpStream, head_only: bool, held: &mut Reservation
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => {
-                if buf.len() + n > MAX_RESPONSE {
+                if buf.len() + n > max_response {
                     return Err(ProxyError::TooLarge);
                 }
                 // Twice: these bytes, and their copy in the re-framed response.

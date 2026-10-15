@@ -3,10 +3,11 @@
 //! the real upstream, so the whole chain is exercised: PROXY line, gate,
 //! two-round CAPTCHA, pass cookie, forwarding, and the per-circuit limits.
 
+use onion_gate::config::Limits;
 use onion_gate::store::{from_hex, to_hex, Store, Token};
 use onion_gate::upstream::Upstream;
 use onion_gate::limit::{Memory, Owner, MAX_BUFFERED_PER_CIRCUIT};
-use onion_gate::{captcha, limit::Limiter, serve_connection, App, COOKIE, ROUNDS};
+use onion_gate::{captcha, limit::Limiter, serve_connection, App, COOKIE};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::sync::Arc;
@@ -81,9 +82,28 @@ fn start_custom(linger: bool, memory: Memory) -> (u16, Arc<App>) {
         limiter: Limiter::new(),
         upstream: Upstream::new(&backend, COOKIE).unwrap(),
         proxy: true,
-        max_body: 64 * 1024,
         memory,
+        limits: Limits { max_body: 64 * 1024, ..Limits::default() },
     });
+    let a = Arc::clone(&app);
+    thread::spawn(move || {
+        for s in listener.incoming().flatten() {
+            let a2 = Arc::clone(&a);
+            thread::spawn(move || {
+                let mut s = s;
+                serve_connection(&mut s, &a2);
+            });
+        }
+    });
+    (port, app)
+}
+
+/// A gate built the way the binary builds it, from configured limits.
+fn start_limits(limits: Limits) -> (u16, Arc<App>) {
+    let backend = backend(false);
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Arc::new(App::new(Upstream::new(&backend, COOKIE).unwrap(), true, limits));
     let a = Arc::clone(&app);
     thread::spawn(move || {
         for s in listener.incoming().flatten() {
@@ -158,7 +178,7 @@ fn click_body(app: &App, tok: &Token) -> String {
 /// Solves every round starting from a challenge page, returns the final reply.
 fn solve(port: u16, app: &App, circuit: u32, first: &str) -> String {
     let mut resp = first.to_string();
-    for i in 0..ROUNDS {
+    for i in 0..app.limits.rounds {
         assert!(is_challenge(&resp), "round {}: expected a challenge, got:\n{}", i + 1, &resp[..resp.len().min(200)]);
         let body = click_body(app, &token_of(&resp));
         resp = send(port, circuit, "POST", "/__gate/verify", None, Some(&body));
@@ -357,8 +377,8 @@ fn an_unreachable_backend_is_a_502_not_a_hang() {
         limiter: Limiter::new(),
         upstream: Upstream::new(&dead, COOKIE).unwrap(),
         proxy: true,
-        max_body: 64 * 1024,
         memory: Memory::default(),
+        limits: Limits { max_body: 64 * 1024, ..Limits::default() },
     });
     let a = Arc::clone(&app);
     thread::spawn(move || {
@@ -485,4 +505,33 @@ fn one_circuit_cannot_hold_more_than_its_share_of_the_budget() {
     drop(held);
     let r = send(port, c, "GET", "/c", Some(&pass), None);
     assert!(r.starts_with("HTTP/1.1 200"), "{}", &r[..r.len().min(120)]);
+}
+
+#[test]
+fn configured_rounds_and_challenge_lifetime_are_used() {
+    for rounds in [1u8, 3] {
+        let (port, app) = start_limits(Limits { rounds, challenge_ttl: Duration::from_secs(45), ..Limits::default() });
+        let first = send(port, 0x0B00_0000 + rounds as u32, "GET", "/x", None, None);
+        assert!(first.contains(&format!("(1/{})", rounds)), "round counter for {} rounds", rounds);
+        assert!(first.contains("animation:d 45s"), "the time bar follows challenge_ttl");
+        let done = solve(port, &app, 0x0B00_0000 + rounds as u32, &first);
+        assert!(done.starts_with("HTTP/1.1 303"), "{} rounds then a pass:\n{}", rounds, &done[..done.len().min(300)]);
+    }
+}
+
+#[test]
+fn configured_circuit_and_pass_budgets_are_used() {
+    let limits = Limits { challenge_burst: 3, pass_burst: 3, pass_per_minute: 1, ..Limits::default() };
+    let (port, app) = start_limits(limits);
+    let c = 0x0C0C_0C0C;
+    // 1 image + 2 verifications (one per round): the challenge burst of 3 is spent.
+    let first = send(port, c, "GET", "/", None, None);
+    let pass = pass_of(&solve(port, &app, c, &first));
+    assert!(send(port, c, "GET", "/__gate/", None, None).starts_with("HTTP/1.1 429"), "challenge_burst = 3");
+    // The pass's own budget: 3 requests, then it is revoked.
+    for _ in 0..3 {
+        assert!(send(port, c, "GET", "/p", Some(&pass), None).contains("BACKEND saw"));
+    }
+    let r = send(port, c, "GET", "/p", Some(&pass), None);
+    assert!(!r.contains("BACKEND saw"), "pass_burst = 3: the 4th request must not reach the backend");
 }

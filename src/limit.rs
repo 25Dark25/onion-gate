@@ -15,7 +15,11 @@
 //! To take the service down, an attacker needs many circuits, and every new
 //! circuit goes through tor's defenses (PoW included).
 //! Policy: when in doubt, deny (fail-closed).
+//!
+//! The constants below are the defaults; the configuration (config.rs) can
+//! change them, and checks the rules between them at start-up.
 
+use crate::config::Limits;
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -36,15 +40,12 @@ pub const CIRCUIT_PAGE_BURST: f32 = 90.0;
 /// looser than the per-pass limit (store.rs), so an honest visitor never hits
 /// this one first.
 pub const CIRCUIT_PAGE_REFILL_PER_SEC: f32 = 1.5;
-// Contract between the two page limits, checked at compile time: with a single
-// pass, the per-pass bucket (store.rs) is the one that trips first.
-const _: () = assert!(CIRCUIT_PAGE_BURST > crate::store::PASS_BURST);
-const _: () = assert!(CIRCUIT_PAGE_REFILL_PER_SEC > crate::store::PASS_REFILL_PER_SEC);
 /// Maximum number of circuits remembered (bounded memory).
 const MAX_ENTRIES: usize = 50_000;
 /// A circuit idle for this long is forgotten. Must be at least the time any
 /// bucket needs to refill completely, or forgetting would hand back a full
-/// bucket early: challenges 60 s, pages 60 s (90 / 1.5). 600 s covers both.
+/// bucket early (with the defaults: challenges 60 s, pages 60 s). The limiter
+/// raises it when the configured buckets take longer.
 const IDLE_FORGET: Duration = Duration::from_secs(600);
 const PURGE_EVERY: Duration = Duration::from_secs(1);
 
@@ -93,23 +94,34 @@ struct Inner {
     last_purge: Instant,
 }
 
+/// The per-circuit settings in force (from the configuration).
+#[derive(Clone, Copy)]
+struct CircuitLimits {
+    conns: u16,
+    challenge_burst: f32,
+    challenge_per_sec: f32,
+    page_burst: f32,
+    page_per_sec: f32,
+    forget: Duration,
+}
+
 impl Inner {
-    fn purge(&mut self, now: Instant) {
+    fn purge(&mut self, now: Instant, forget: Duration) {
         match now.checked_duration_since(self.last_purge) {
             Some(d) if d >= PURGE_EVERY => {}
             _ => return,
         }
         self.last_purge = now;
         self.map.retain(|_, e| {
-            e.active > 0 || now.checked_duration_since(e.last).is_none_or(|d| d < IDLE_FORGET)
+            e.active > 0 || now.checked_duration_since(e.last).is_none_or(|d| d < forget)
         });
     }
 
     /// The circuit's entry, created if there is room. None if the map is full.
-    fn entry(&mut self, c: u32, now: Instant) -> Option<&mut Entry> {
+    fn entry(&mut self, c: u32, now: Instant, l: &CircuitLimits) -> Option<&mut Entry> {
         if !self.map.contains_key(&c) {
             if self.map.len() >= MAX_ENTRIES {
-                self.purge(now);
+                self.purge(now, l.forget);
                 if self.map.len() >= MAX_ENTRIES {
                     return None;
                 }
@@ -118,8 +130,8 @@ impl Inner {
                 c,
                 Entry {
                     active: 0,
-                    challenges: Bucket::full(CHALLENGE_BURST, now),
-                    pages: Bucket::full(CIRCUIT_PAGE_BURST, now),
+                    challenges: Bucket::full(l.challenge_burst, now),
+                    pages: Bucket::full(l.page_burst, now),
                     last: now,
                 },
             );
@@ -134,6 +146,7 @@ impl Inner {
 
 pub struct Limiter {
     inner: Mutex<Inner>,
+    limits: CircuitLimits,
 }
 
 impl Default for Limiter {
@@ -158,12 +171,31 @@ impl Drop for ConnSlot<'_> {
 }
 
 impl Limiter {
+    /// A limiter with the default settings.
     pub fn new() -> Limiter {
+        Self::with_limits(&Limits::default())
+    }
+
+    /// A limiter with the configured per-circuit settings.
+    pub fn with_limits(l: &Limits) -> Limiter {
+        // Forgetting a circuit must not hand back a full bucket early.
+        let refill = |burst: u32, per_min: u32| Duration::from_secs((burst as u64 * 60).div_ceil(per_min.max(1) as u64));
+        let forget = IDLE_FORGET
+            .max(refill(l.challenge_burst, l.challenge_per_minute))
+            .max(refill(l.circuit_burst, l.circuit_per_minute));
         Limiter {
             inner: Mutex::new(Inner {
                 map: HashMap::new(),
                 last_purge: Instant::now(),
             }),
+            limits: CircuitLimits {
+                conns: l.conn_per_circuit,
+                challenge_burst: l.challenge_burst as f32,
+                challenge_per_sec: l.challenge_per_sec(),
+                page_burst: l.circuit_burst as f32,
+                page_per_sec: l.circuit_per_sec(),
+                forget,
+            },
         }
     }
 
@@ -175,8 +207,8 @@ impl Limiter {
     pub fn enter(&self, circuit: u32) -> Option<ConnSlot<'_>> {
         let now = Instant::now();
         let mut g = self.lock();
-        let e = g.entry(circuit, now)?;
-        if e.active >= MAX_CONN_PER_CIRCUIT {
+        let e = g.entry(circuit, now, &self.limits)?;
+        if e.active >= self.limits.conns {
             return None;
         }
         e.active += 1;
@@ -193,8 +225,8 @@ impl Limiter {
 
     fn take_at(&self, now: Instant, circuit: u32) -> bool {
         let mut g = self.lock();
-        match g.entry(circuit, now) {
-            Some(e) => e.challenges.take(now, CHALLENGE_BURST, CHALLENGE_REFILL_PER_SEC),
+        match g.entry(circuit, now, &self.limits) {
+            Some(e) => e.challenges.take(now, self.limits.challenge_burst, self.limits.challenge_per_sec),
             None => false,
         }
     }
@@ -206,8 +238,8 @@ impl Limiter {
 
     fn take_page_at(&self, now: Instant, circuit: u32) -> bool {
         let mut g = self.lock();
-        match g.entry(circuit, now) {
-            Some(e) => e.pages.take(now, CIRCUIT_PAGE_BURST, CIRCUIT_PAGE_REFILL_PER_SEC),
+        match g.entry(circuit, now, &self.limits) {
+            Some(e) => e.pages.take(now, self.limits.page_burst, self.limits.page_per_sec),
             None => false,
         }
     }
@@ -230,8 +262,6 @@ pub const MAX_BUFFERED_PER_CIRCUIT: usize = 24 * 1024 * 1024;
 /// bound to a circuit). Filling the whole budget then takes at least
 /// MAX_BUFFERED / MAX_BUFFERED_PER_PASS passes, each a solved CAPTCHA.
 pub const MAX_BUFFERED_PER_PASS: usize = 32 * 1024 * 1024;
-const _: () = assert!(MAX_BUFFERED_PER_CIRCUIT <= MAX_BUFFERED_PER_PASS);
-const _: () = assert!(MAX_BUFFERED_PER_PASS < MAX_BUFFERED);
 
 /// Who a reservation is charged to, besides the global budget.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -266,6 +296,11 @@ impl Memory {
     /// A budget of `max` bytes with the default per-circuit and per-pass shares.
     pub fn new(max: usize) -> Memory {
         Self::with_shares(max, MAX_BUFFERED_PER_CIRCUIT, MAX_BUFFERED_PER_PASS)
+    }
+
+    /// The configured budget and shares.
+    pub fn from_limits(l: &Limits) -> Memory {
+        Self::with_shares(l.memory, l.memory_per_circuit, l.memory_per_pass)
     }
 
     pub fn with_shares(max: usize, max_circuit: usize, max_pass: usize) -> Memory {

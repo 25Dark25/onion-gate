@@ -25,7 +25,7 @@ pub mod store;
 pub mod upstream;
 
 use http::{HttpError, Reply, Request};
-use limit::Limiter;
+use limit::{Limiter, Memory, Reservation};
 use rng::Rng;
 use std::net::TcpStream;
 use store::{PassUse, Store, Token};
@@ -64,13 +64,16 @@ pub struct App {
     pub proxy: bool,
     /// Largest request body accepted (and thus forwarded).
     pub max_body: usize,
+    /// Global budget for buffered request and response bytes.
+    pub memory: Memory,
 }
 
 /// What `route` produces: either a page the gate generated, or already-framed
-/// bytes from the upstream to relay verbatim.
-pub enum Out {
+/// bytes from the upstream to relay verbatim (with their share of the memory
+/// budget, released once they are sent).
+pub enum Out<'a> {
     Reply(Reply),
-    Raw(Vec<u8>),
+    Raw(Vec<u8>, Reservation<'a>),
 }
 
 // --------------------------------------------------------------- return path
@@ -126,8 +129,6 @@ fn challenge_allowed(app: &App, circuit: Option<u32>) -> bool {
 /// Handles one connection end to end: the PROXY line (proxy mode), the
 /// per-circuit connection slot, one request, and the reply.
 pub fn serve_connection(stream: &mut TcpStream, app: &App) {
-    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
-
     let (circuit, initial) = if app.proxy {
         match http::read_proxy(stream) {
             Ok((c, rest)) => (Some(c), rest),
@@ -152,10 +153,21 @@ pub fn serve_connection(stream: &mut TcpStream, app: &App) {
         None => None,
     };
 
+    // The body's memory (twice: it is copied into the forwarded request) is
+    // held until the reply has been sent.
+    let mut body_mem: Option<Reservation<'_>> = None;
     let req = http::read_head(stream, initial).and_then(|p| {
+        let cl = p.content_length.unwrap_or(0);
         if may_forward(&p.req, app) {
+            if cl > app.max_body {
+                return Err(http::HttpError::TooLarge);
+            }
+            match app.memory.reserve(cl.saturating_mul(2)) {
+                Some(r) => body_mem = Some(r),
+                None => return Err(http::HttpError::Busy),
+            }
             p.read_body(stream, app.max_body)
-        } else if p.content_length.unwrap_or(0) <= GATE_MAX_BODY {
+        } else if cl <= GATE_MAX_BODY {
             p.read_body(stream, GATE_MAX_BODY)
         } else {
             Ok(p.skip_body())
@@ -164,7 +176,7 @@ pub fn serve_connection(stream: &mut TcpStream, app: &App) {
     match req {
         Ok(req) => match route(&req, circuit, app) {
             Out::Reply(r) => http::send(stream, &r),
-            Out::Raw(bytes) => http::send_raw(stream, &bytes),
+            Out::Raw(bytes, _held) => http::send_raw(stream, &bytes),
         },
         Err(e) => {
             if let Some(reply) = error_reply(&e) {
@@ -177,6 +189,9 @@ pub fn serve_connection(stream: &mut TcpStream, app: &App) {
 
 fn error_reply(e: &HttpError) -> Option<Reply> {
     let status = e.status()?;
+    if status == 503 {
+        return Some(Reply::page(503, html::message(MSG_BUSY)));
+    }
     let mut r = Reply::page(status, html::message(&format!("Error {}", status)));
     if status == 405 {
         r.extra.push(("Allow", "GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS".to_string()));
@@ -201,7 +216,7 @@ fn may_forward(req: &Request, app: &App) -> bool {
 }
 
 /// Routes one parsed request.
-pub fn route(req: &Request, circuit: Option<u32>, app: &App) -> Out {
+pub fn route<'a>(req: &Request, circuit: Option<u32>, app: &'a App) -> Out<'a> {
     if in_gate_namespace(&req.path) {
         Out::Reply(gate_route(req, circuit, app))
     } else {
@@ -234,7 +249,7 @@ fn gate_route(req: &Request, circuit: Option<u32>, app: &App) -> Reply {
 /// Everything that is not the gate's namespace: the backend, behind the gate.
 /// Without a valid pass the answer is always a challenge (the backend is never
 /// reached, and nothing about it is revealed).
-fn gated(req: &Request, circuit: Option<u32>, app: &App) -> Out {
+fn gated<'a>(req: &Request, circuit: Option<u32>, app: &'a App) -> Out<'a> {
     // Where to send the visitor after they pass. A non-GET cannot be replayed,
     // so it returns to "/".
     let ret = if req.is_get() {
@@ -262,8 +277,9 @@ fn gated(req: &Request, circuit: Option<u32>, app: &App) -> Out {
     }
 
     // Valid pass: forward to the backend.
-    match app.upstream.forward(req) {
-        Ok(bytes) => Out::Raw(bytes),
+    match app.upstream.forward(req, &app.memory) {
+        Ok((bytes, held)) => Out::Raw(bytes, held),
+        Err(upstream::ProxyError::Busy) => Out::Reply(Reply::page(503, html::message(MSG_BUSY))),
         Err(e) => Out::Reply(Reply::page(e.status(), html::message(MSG_GATEWAY))),
     }
 }

@@ -198,6 +198,8 @@ it.
 | Request head / target cap | 16 KiB / 2 KiB | `MAX_HEAD`, `MAX_TARGET` in `src/http.rs` |
 | Read deadlines (head / body) | 8 s / 60 s | `READ_DEADLINE`, `BODY_DEADLINE` in `src/http.rs` |
 | Upstream response cap / timeouts | 8 MiB / 5 s connect, 30 s I/O | top of `src/upstream.rs` |
+| Buffered bytes, all connections | 128 MiB | `MAX_BUFFERED` in `src/limit.rs` |
+| Time to deliver one response | 300 s | `SEND_DEADLINE` in `src/http.rs` |
 | Image difficulty | — | constants at the top of `src/captcha.rs` |
 | CAPTCHA page text and style | — | `src/html.rs` |
 
@@ -236,8 +238,8 @@ Guarantees (as far as the code goes):
   throughout.
 - **Loopback only:** listens on `127.0.0.1`; the upstream must be loopback too.
 - **No visitor data added** to forwarded requests; the pass cookie is stripped.
-- **Bounded memory** in every store, and no request body buffered (beyond
-  1 KiB) for a visitor without a valid pass.
+- **Bounded memory** in every store and for all buffered bodies together, and
+  no request body buffered (beyond 1 KiB) for a visitor without a valid pass.
 
 ## Limitations
 
@@ -250,10 +252,19 @@ Be honest with yourself about what this is:
   author only. Read it before you trust it.
 - **Passes are transferable.** A pass is a bearer cookie, not bound to a circuit;
   its budget and lifetime limit how much a shared pass is worth, no more.
-- **Whole request/response buffered in memory**, each capped. No streaming, no
-  WebSockets (`101 Switching Protocols` is refused), no HTTP/2, no large
-  uploads/downloads beyond the caps. Raise `--max-body` and the response cap if
-  you need more, at a memory cost.
+- **Whole request/response buffered in memory**, each capped, and all of them
+  together capped by a global budget (`MAX_BUFFERED`, 128 MiB): past it,
+  forwarded requests get `503` until memory is freed, instead of the process
+  running out of memory. No streaming, no WebSockets (`101 Switching
+  Protocols` is refused), no HTTP/2, no large uploads/downloads beyond the
+  caps. Raise `--max-body`, the response cap and the budget if you need more,
+  at a memory cost.
+- **Slow readers hold their response.** A visitor with a valid pass who reads
+  very slowly keeps its buffered response, and its share of the budget, for up
+  to `SEND_DEADLINE` (300 s). The per-circuit connection limit bounds how much
+  one circuit can hold this way, not how much many circuits can. A site that
+  serves large files to untrusted visitors should keep them out of reach of
+  the gate or lower the response cap.
 - **Strict about the backend too.** A response with a `Transfer-Encoding` other
   than plain `chunked`, conflicting `Content-Length`s, a header name that is not
   a token, or control bytes or non-UTF-8 bytes in the status line or a header is

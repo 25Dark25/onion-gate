@@ -34,6 +34,13 @@ const BODY_DEADLINE: Duration = Duration::from_secs(60);
 const PROXY_DEADLINE: Duration = Duration::from_secs(2);
 /// Maximum length of a PROXY v1 line per its specification (CRLF included).
 const MAX_PROXY_LINE: usize = 107;
+/// Longest any write may block before the connection is dropped...
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// ...and the total time allowed to deliver one response. A visitor reading
+/// very slowly would otherwise keep its buffered response (and its share of
+/// the memory budget) indefinitely, as long as each write made some progress.
+/// 8 MiB at a slow 30 KB/s over Tor takes under 300 s.
+pub const SEND_DEADLINE: Duration = Duration::from_secs(300);
 
 /// Request methods the gate accepts and will forward. Anything else is 405.
 pub const METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"];
@@ -72,6 +79,8 @@ pub enum HttpError {
     LengthRequired,
     TooLarge,
     HeadTooLarge,
+    /// The memory budget for buffered bodies is spent.
+    Busy,
     /// The client closed / I/O error: nothing is sent back.
     Closed,
 }
@@ -85,6 +94,7 @@ impl HttpError {
             HttpError::LengthRequired => Some(411),
             HttpError::TooLarge => Some(413),
             HttpError::HeadTooLarge => Some(431),
+            HttpError::Busy => Some(503),
             HttpError::Closed => None,
         }
     }
@@ -501,13 +511,29 @@ pub fn send(stream: &mut TcpStream, r: &Reply) {
 
     let mut out = head.into_bytes();
     out.extend_from_slice(r.body.as_bytes());
-    let _ = stream.write_all(&out);
-    let _ = stream.flush();
+    send_raw(stream, &out);
 }
 
 /// Writes already-framed response bytes (used for a relayed upstream response).
+/// Gives up silently after SEND_DEADLINE, or a write blocked for WRITE_TIMEOUT.
 pub fn send_raw(stream: &mut TcpStream, bytes: &[u8]) {
-    let _ = stream.write_all(bytes);
+    let deadline = Instant::now() + SEND_DEADLINE;
+    let mut off = 0;
+    while off < bytes.len() {
+        let left = match deadline.checked_duration_since(Instant::now()) {
+            Some(d) if !d.is_zero() => d.min(WRITE_TIMEOUT),
+            _ => return,
+        };
+        if stream.set_write_timeout(Some(left)).is_err() {
+            return;
+        }
+        match stream.write(&bytes[off..]) {
+            Ok(0) => return,
+            Ok(n) => off += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        }
+    }
     let _ = stream.flush();
 }
 

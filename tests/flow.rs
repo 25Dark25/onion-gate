@@ -5,6 +5,7 @@
 
 use onion_gate::store::{from_hex, to_hex, Store, Token};
 use onion_gate::upstream::Upstream;
+use onion_gate::limit::Memory;
 use onion_gate::{captcha, limit::Limiter, serve_connection, App, COOKIE, ROUNDS};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
@@ -68,6 +69,10 @@ fn start() -> (u16, Arc<App>) {
 }
 
 fn start_with(linger: bool) -> (u16, Arc<App>) {
+    start_custom(linger, Memory::default())
+}
+
+fn start_custom(linger: bool, memory: Memory) -> (u16, Arc<App>) {
     let backend = backend(linger);
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -77,6 +82,7 @@ fn start_with(linger: bool) -> (u16, Arc<App>) {
         upstream: Upstream::new(&backend, COOKIE).unwrap(),
         proxy: true,
         max_body: 64 * 1024,
+        memory,
     });
     let a = Arc::clone(&app);
     thread::spawn(move || {
@@ -352,6 +358,7 @@ fn an_unreachable_backend_is_a_502_not_a_hang() {
         upstream: Upstream::new(&dead, COOKIE).unwrap(),
         proxy: true,
         max_body: 64 * 1024,
+        memory: Memory::default(),
     });
     let a = Arc::clone(&app);
     thread::spawn(move || {
@@ -405,4 +412,18 @@ fn a_large_body_with_a_valid_pass_is_forwarded() {
     let body = "a".repeat(50_000);
     let r = send(port, c, "POST", "/big", Some(&pass), Some(&body));
     assert!(r.starts_with("HTTP/1.1 200") && r.contains(&body), "{}", &r[..r.len().min(120)]);
+}
+
+#[test]
+fn a_spent_memory_budget_is_a_503_not_an_oom() {
+    // A budget too small for any forwarded request: the gate itself (challenge,
+    // verify) still works, and forwarding answers 503 instead of buffering.
+    let (port, app) = start_custom(false, Memory::new(100));
+    let c = 0x3737_3737;
+    let pass = pass_for(port, app.as_ref(), c);
+    let get = send(port, c, "GET", "/", Some(&pass), None);
+    assert!(get.starts_with("HTTP/1.1 503") && !get.contains("BACKEND"), "{}", &get[..get.len().min(120)]);
+    let post = send(port, c, "POST", "/", Some(&pass), Some(&"x".repeat(80)));
+    assert!(post.starts_with("HTTP/1.1 503") && !post.contains("BACKEND"), "{}", &post[..post.len().min(120)]);
+    assert_eq!(app.memory.used(), 0, "every reservation is given back");
 }

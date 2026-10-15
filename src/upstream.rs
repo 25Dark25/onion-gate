@@ -20,6 +20,7 @@
 //!    read-to-EOF frames the body.
 
 use crate::http::{self, Request};
+use crate::limit::{Memory, Reservation};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
@@ -53,6 +54,8 @@ pub enum ProxyError {
     BadResponse,
     /// The upstream response exceeded `MAX_RESPONSE`.
     TooLarge,
+    /// The global buffer budget (`limit::MAX_BUFFERED`) is spent.
+    Busy,
 }
 
 impl ProxyError {
@@ -62,6 +65,7 @@ impl ProxyError {
             ProxyError::Connect | ProxyError::BadResponse => 502,
             ProxyError::Timeout => 504,
             ProxyError::TooLarge => 502,
+            ProxyError::Busy => 503,
         }
     }
 }
@@ -90,9 +94,16 @@ impl Upstream {
         Ok(Upstream { addrs, pass_cookie })
     }
 
+    /// Every address `--upstream` resolved to.
+    pub fn addrs(&self) -> &[SocketAddr] {
+        &self.addrs
+    }
+
     /// Forwards one request and returns the response, already framed as bytes
-    /// ready to write to the visitor's connection.
-    pub fn forward(&self, req: &Request) -> Result<Vec<u8>, ProxyError> {
+    /// ready to write to the visitor's connection, together with its share of
+    /// the memory budget (hold it until the bytes are sent).
+    pub fn forward<'m>(&self, req: &Request, mem: &'m Memory) -> Result<(Vec<u8>, Reservation<'m>), ProxyError> {
+        let mut held = mem.reserve(0).ok_or(ProxyError::Busy)?;
         let wire = build_request(req, self.pass_cookie);
         // `localhost` may resolve to ::1 and 127.0.0.1; use the first that answers.
         let mut stream = self
@@ -101,14 +112,23 @@ impl Upstream {
             .find_map(|a| TcpStream::connect_timeout(a, CONNECT_TIMEOUT).ok())
             .ok_or(ProxyError::Connect)?;
         stream.set_write_timeout(Some(IO_TIMEOUT)).map_err(|_| ProxyError::Connect)?;
-        stream.write_all(&wire).map_err(|_| ProxyError::Connect)?;
-        stream.flush().map_err(|_| ProxyError::Connect)?;
         // No half-close: some servers read an early FIN as "client gave up".
         // `Connection: close` and an exact Content-Length frame the request.
+        let sent = stream.write_all(&wire).and_then(|_| stream.flush()).is_ok();
+        drop(wire);
 
+        // Even if the write failed, the backend may have answered before closing
+        // (e.g. a 413 for a body it did not want): relay that if it is there.
         let head_only = req.method == "HEAD";
-        let raw = read_response(&mut stream, head_only)?;
-        frame_response(&raw, head_only)
+        let raw = match read_response(&mut stream, head_only, &mut held) {
+            Ok(raw) => raw,
+            Err(_) if !sent => return Err(ProxyError::Connect),
+            Err(e) => return Err(e),
+        };
+        let framed = frame_response(&raw, head_only)?;
+        drop(raw);
+        held.shrink_to(framed.len());
+        Ok((framed, held))
     }
 }
 
@@ -234,10 +254,11 @@ fn parse_head(raw: &[u8], head_only: bool) -> Result<Option<Head<'_>>, ProxyErro
     }
 }
 
-/// Reads the upstream response into memory, bounded by MAX_RESPONSE and a total
-/// deadline. Stops as soon as the response is complete by its own framing, so a
-/// backend that keeps the connection open is not waited on until the timeout.
-fn read_response(stream: &mut TcpStream, head_only: bool) -> Result<Vec<u8>, ProxyError> {
+/// Reads the upstream response into memory, bounded by MAX_RESPONSE, the
+/// global memory budget and a total deadline. Stops as soon as the response is
+/// complete by its own framing, so a backend that keeps the connection open is
+/// not waited on until the timeout.
+fn read_response(stream: &mut TcpStream, head_only: bool, held: &mut Reservation<'_>) -> Result<Vec<u8>, ProxyError> {
     let deadline = Instant::now() + IO_TIMEOUT;
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
     let mut chunk = [0u8; 8192];
@@ -257,6 +278,10 @@ fn read_response(stream: &mut TcpStream, head_only: bool) -> Result<Vec<u8>, Pro
             Ok(n) => {
                 if buf.len() + n > MAX_RESPONSE {
                     return Err(ProxyError::TooLarge);
+                }
+                // Twice: these bytes, and their copy in the re-framed response.
+                if !held.grow(2 * n) {
+                    return Err(ProxyError::Busy);
                 }
                 buf.extend_from_slice(&chunk[..n]);
             }
@@ -792,6 +817,48 @@ mod tests {
         req("GET", vec![("Host", "h")], b"")
     }
 
+    fn fwd(up: &Upstream) -> Result<Vec<u8>, ProxyError> {
+        let mem = Memory::default();
+        let out = up.forward(&get(), &mem).map(|(bytes, _held)| bytes);
+        assert_eq!(mem.used(), 0, "the budget must be given back");
+        out
+    }
+
+    #[test]
+    fn a_response_over_the_memory_budget_is_busy_not_buffered() {
+        let up = scripted_backend(vec![b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n".to_vec(), vec![b'x'; 1000]]);
+        let mem = Memory::new(500);
+        assert!(matches!(up.forward(&get(), &mem), Err(ProxyError::Busy)));
+        assert_eq!(mem.used(), 0);
+        // within budget, the reservation is the framed size, held by the caller
+        let up = scripted_backend(vec![b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec()]);
+        let mem = Memory::new(10_000);
+        let (bytes, held) = up.forward(&get(), &mem).unwrap();
+        assert_eq!(mem.used(), bytes.len());
+        drop(held);
+        assert_eq!(mem.used(), 0);
+    }
+
+    #[test]
+    fn an_early_answer_is_relayed_even_if_the_backend_stopped_reading() {
+        // The backend answers 413 and closes without reading a large body.
+        use std::net::{Ipv4Addr, TcpListener};
+        let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = l.accept() {
+                let mut head = [0u8; 256];
+                let _ = s.read(&mut head);
+                let _ = s.write_all(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        let up = Upstream::new(&addr, "p").unwrap();
+        let big = req("POST", vec![("Host", "h")], &vec![b'x'; 8 * 1024 * 1024]);
+        let mem = Memory::default();
+        let (bytes, _held) = up.forward(&big, &mem).expect("the 413 is relayed, not a 502");
+        assert!(String::from_utf8_lossy(&bytes).starts_with("HTTP/1.1 413"));
+    }
+
     #[test]
     fn chunk_data_that_looks_like_the_last_chunk_does_not_end_the_read() {
         // The first chunk's data ends in "0\r\n" and is followed by its CRLF, so
@@ -801,7 +868,7 @@ mod tests {
             b"3\r\nxyz\r\n0\r\n\r\n".to_vec(),
         ]);
         let t0 = Instant::now();
-        let out = String::from_utf8(up.forward(&get()).expect("complete response")).unwrap();
+        let out = String::from_utf8(fwd(&up).expect("complete response")).unwrap();
         assert!(out.ends_with("\r\n\r\nabc,0\r\nxyz"), "{:?}", out);
         assert!(t0.elapsed() < Duration::from_secs(5), "took {:?}", t0.elapsed());
     }
@@ -812,7 +879,7 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\nX-Trailer: 1\r\n\r\n".to_vec(),
         ]);
         let t0 = Instant::now();
-        let out = String::from_utf8(up.forward(&get()).expect("complete response")).unwrap();
+        let out = String::from_utf8(fwd(&up).expect("complete response")).unwrap();
         assert!(out.ends_with("Content-Length: 2\r\nConnection: close\r\n\r\nok"), "{:?}", out);
         assert!(t0.elapsed() < Duration::from_secs(5), "took {:?}", t0.elapsed());
     }

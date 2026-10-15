@@ -6,7 +6,7 @@
 
 use onion_gate::http::DEFAULT_MAX_BODY;
 use onion_gate::upstream::Upstream;
-use onion_gate::{limit::Limiter, serve_connection, store::Store, App, COOKIE};
+use onion_gate::{limit::Limiter, limit::Memory, serve_connection, store::Store, App, COOKIE};
 use std::net::{Ipv4Addr, TcpListener};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -114,6 +114,7 @@ fn main() {
         upstream,
         proxy: cfg.proxy,
         max_body: cfg.max_body,
+        memory: Memory::default(),
     });
 
     for conn in listener.incoming() {

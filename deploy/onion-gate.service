@@ -33,8 +33,13 @@ SystemCallArchitectures=native
 # onion-gate listens on loopback and only connects to a loopback upstream.
 IPAddressAllow=localhost
 IPAddressDeny=any
-TasksMax=512
-MemoryMax=256M
+# One thread per connection: MAX_CONN (512) plus the main thread, with margin.
+TasksMax=520
+# Worst case is about 300 MiB: 128 MiB of buffered bodies (MAX_BUFFERED), up to
+# ~130 MiB of challenge images being drawn at once, and the bounded stores.
+# Over this, systemd kills the service and every pass is lost, so keep it above
+# that sum if you raise any of those limits.
+MemoryMax=512M
 Restart=on-failure
 RestartSec=2
 

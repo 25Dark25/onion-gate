@@ -1,5 +1,7 @@
 # onion-gate
 
+[![tests](https://github.com/25Dark25/onion-gate/actions/workflows/test.yml/badge.svg)](https://github.com/25Dark25/onion-gate/actions/workflows/test.yml)
+
 A no-JavaScript CAPTCHA **gate** and **reverse proxy** that sits in front of any
 local web backend. Nothing behind it is reachable until the visitor passes a
 "click the broken circle" challenge; once they do, their requests are forwarded
@@ -117,6 +119,29 @@ Flags:
 Then open the `.onion` (or `http://127.0.0.1:8088` for a local test) in Tor
 Browser: you get the CAPTCHA first, and your site after.
 
+## Download and verify a release
+
+Releases are on the [Releases page](https://github.com/25Dark25/onion-gate/releases). Each one contains the source zip, a detached OpenPGP signature (`.asc`) and the SHA-256 of the zip in the release notes. There are no prebuilt binaries: verify the zip, then build it with `cargo build --release --offline`.
+
+**PGP key fingerprint:** `A7FC EDEA D7E6 C343 7312  284A 442D A687 E0FF 73EE`
+
+- Published at keys.openpgp.org: <https://keys.openpgp.org/vks/v1/by-fingerprint/A7FCEDEAD7E6C3437312284A442DA687E0FF73EE>
+- Also on GitHub: <https://github.com/25Dark25.gpg>
+
+```bash
+# Linux / macOS
+curl -sSL https://github.com/25Dark25.gpg | gpg --import
+# Windows (PowerShell), to verify the download before copying it to a Unix host
+Invoke-WebRequest https://github.com/25Dark25.gpg -OutFile 25Dark25.gpg; gpg --import 25Dark25.gpg
+
+gpg --fingerprint A7FCEDEAD7E6C3437312284A442DA687E0FF73EE   # must match the fingerprint above
+gpg --verify onion-gate-0.1.0.zip.asc onion-gate-0.1.0.zip     # use the file names of the release you downloaded
+```
+
+`gpg` will report a good signature and also warn that the key is not certified; that is expected. What matters is that the fingerprint is the same in several independent places (this README, the release notes and keys.openpgp.org). A valid signature shows the file was published by whoever controls that key, not who that person is.
+
+To check the hash: `sha256sum onion-gate-0.1.0.zip` (Linux), `shasum -a 256 onion-gate-0.1.0.zip` (macOS) or `Get-FileHash onion-gate-0.1.0.zip -Algorithm SHA256` (PowerShell), and compare it with the release notes.
+
 ## Putting it in front of any server
 
 onion-gate speaks plain HTTP/1.1 to one loopback backend. Point `--upstream` at
@@ -184,6 +209,7 @@ src/png.rs       PNG encoder
 src/rng.rs       randomness from /dev/urandom
 tests/flow.rs    end-to-end tests over real sockets (gate, forwarding, limits, no open redirect)
 deploy/          example torrc and a hardened systemd unit
+.github/         CI (tests on Linux and macOS, MSRV and stable) and Dependabot
 ```
 
 ## Security properties
@@ -231,6 +257,22 @@ Be honest with yourself about what this is:
   per-circuit limits here, not the CAPTCHA's.
 - **The warrant-canary, payments, catalog and everything e-commerce** from the
   original project are intentionally **not** here. This is only the gate.
+
+## Development
+
+This project was developed with the help of Claude (Anthropic) and directed, tested and published by its author. Treat it like any unaudited security code: read `src/`, run the tests, and judge it by what can be verified rather than by who wrote it.
+
+```bash
+cargo test --offline                              # unit + end-to-end tests
+cargo clippy --offline --all-targets -- -D warnings
+cargo build --release --offline
+```
+
+CI runs the same on Linux and macOS with Rust 1.82 (the minimum supported version) and the latest stable, and fails if the crate gains any dependency.
+
+## Security
+
+To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## License
 

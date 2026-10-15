@@ -20,7 +20,7 @@
 //!    read-to-EOF frames the body.
 
 use crate::http::{self, Request};
-use crate::limit::{Memory, Reservation};
+use crate::limit::{Memory, Owner, Reservation};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
@@ -101,9 +101,15 @@ impl Upstream {
 
     /// Forwards one request and returns the response, already framed as bytes
     /// ready to write to the visitor's connection, together with its share of
-    /// the memory budget (hold it until the bytes are sent).
-    pub fn forward<'m>(&self, req: &Request, mem: &'m Memory) -> Result<(Vec<u8>, Reservation<'m>), ProxyError> {
-        let mut held = mem.reserve(0).ok_or(ProxyError::Busy)?;
+    /// the memory budget, charged to `owners` too (hold it until the bytes are
+    /// sent).
+    pub fn forward<'m>(
+        &self,
+        req: &Request,
+        mem: &'m Memory,
+        owners: &[Owner],
+    ) -> Result<(Vec<u8>, Reservation<'m>), ProxyError> {
+        let mut held = mem.reserve_for(owners, 0).ok_or(ProxyError::Busy)?;
         let wire = build_request(req, self.pass_cookie);
         // `localhost` may resolve to ::1 and 127.0.0.1; use the first that answers.
         let mut stream = self
@@ -838,7 +844,7 @@ mod tests {
 
     fn fwd(up: &Upstream) -> Result<Vec<u8>, ProxyError> {
         let mem = Memory::default();
-        let out = up.forward(&get(), &mem).map(|(bytes, _held)| bytes);
+        let out = up.forward(&get(), &mem, &[]).map(|(bytes, _held)| bytes);
         assert_eq!(mem.used(), 0, "the budget must be given back");
         out
     }
@@ -847,12 +853,12 @@ mod tests {
     fn a_response_over_the_memory_budget_is_busy_not_buffered() {
         let up = scripted_backend(vec![b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n".to_vec(), vec![b'x'; 1000]]);
         let mem = Memory::new(500);
-        assert!(matches!(up.forward(&get(), &mem), Err(ProxyError::Busy)));
+        assert!(matches!(up.forward(&get(), &mem, &[]), Err(ProxyError::Busy)));
         assert_eq!(mem.used(), 0);
         // within budget, the reservation is the framed size, held by the caller
         let up = scripted_backend(vec![b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec()]);
         let mem = Memory::new(10_000);
-        let (bytes, held) = up.forward(&get(), &mem).unwrap();
+        let (bytes, held) = up.forward(&get(), &mem, &[]).unwrap();
         assert_eq!(mem.used(), bytes.len());
         drop(held);
         assert_eq!(mem.used(), 0);
@@ -877,7 +883,7 @@ mod tests {
         let up = Upstream::new(&addr, "p").unwrap();
         let big = req("POST", vec![("Host", "h")], &vec![b'x'; 1024 * 1024]);
         let mem = Memory::default();
-        let (bytes, _held) = up.forward(&big, &mem).expect("the 413 is relayed");
+        let (bytes, _held) = up.forward(&big, &mem, &[]).expect("the 413 is relayed");
         assert!(String::from_utf8_lossy(&bytes).starts_with("HTTP/1.1 413"));
     }
 
@@ -901,7 +907,7 @@ mod tests {
         let up = Upstream::new(&addr, "p").unwrap();
         let big = req("POST", vec![("Host", "h")], &vec![b'x'; 8 * 1024 * 1024]);
         let mem = Memory::default();
-        let (bytes, _held) = up.forward(&big, &mem).expect("the 413 is relayed, not a 502");
+        let (bytes, _held) = up.forward(&big, &mem, &[]).expect("the 413 is relayed, not a 502");
         assert!(String::from_utf8_lossy(&bytes).starts_with("HTTP/1.1 413"));
     }
 

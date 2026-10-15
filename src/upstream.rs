@@ -474,7 +474,8 @@ fn frame_response(raw: &[u8], head_only: bool) -> Result<Vec<u8>, ProxyError> {
     Ok(bytes)
 }
 
-/// `HTTP/1.1 200 OK` -> 200.
+/// `HTTP/1.1 200 OK` -> 200. Only 100..=599 are status codes (RFC 9110 §15);
+/// anything else would be relayed as an invalid status line.
 fn parse_status(line: &str) -> Option<u16> {
     let mut it = line.split(' ');
     let v = it.next()?;
@@ -485,7 +486,7 @@ fn parse_status(line: &str) -> Option<u16> {
     if code.len() != 3 || !code.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    code.parse::<u16>().ok()
+    code.parse::<u16>().ok().filter(|c| (100..=599).contains(c))
 }
 
 /// Longest chunk-size line (size plus any extension) and longest trailer
@@ -717,6 +718,19 @@ mod tests {
         // a truncated response is refused when framed
         assert!(frame_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhi", false).is_err());
         assert!(frame_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", false).is_err(), "chunked twice");
+    }
+
+    #[test]
+    fn a_status_code_outside_100_to_599_is_bad_gateway() {
+        // "000" used to be relayed as "HTTP/1.1 0 OK", an invalid status line.
+        for code in ["000", "099", "600", "999"] {
+            let raw = format!("HTTP/1.1 {} OK\r\nContent-Length: 0\r\n\r\n", code);
+            assert!(frame_response(raw.as_bytes(), false).is_err(), "{} relayed", code);
+        }
+        for code in ["100 x\r\n\r\nHTTP/1.1 200", "200", "418", "599"] {
+            let raw = format!("HTTP/1.1 {} OK\r\nContent-Length: 0\r\n\r\n", code);
+            assert!(frame_response(raw.as_bytes(), false).is_ok(), "{} refused", code);
+        }
     }
 
     #[test]

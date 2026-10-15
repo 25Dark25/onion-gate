@@ -175,7 +175,9 @@ pub fn serve_connection(stream: &mut TcpStream, app: &App) {
     });
     match req {
         Ok(req) => match route(&req, circuit, app) {
+            Out::Reply(r) if req.method == "HEAD" => http::send_head(stream, &r),
             Out::Reply(r) => http::send(stream, &r),
+            // A relayed HEAD response is already body-less (upstream.rs).
             Out::Raw(bytes, _held) => http::send_raw(stream, &bytes),
         },
         Err(e) => {

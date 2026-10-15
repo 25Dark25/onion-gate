@@ -493,6 +493,16 @@ Cross-Origin-Opener-Policy: same-origin\r\n\
 Content-Security-Policy: default-src 'none'; img-src data:; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'\r\n";
 
 pub fn send(stream: &mut TcpStream, r: &Reply) {
+    write_reply(stream, r, true);
+}
+
+/// The reply to a HEAD request: the same headers (Content-Length included, as
+/// for GET), no body.
+pub fn send_head(stream: &mut TcpStream, r: &Reply) {
+    write_reply(stream, r, false);
+}
+
+fn write_reply(stream: &mut TcpStream, r: &Reply, with_body: bool) {
     let mut head = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}",
         r.status,
@@ -510,7 +520,9 @@ pub fn send(stream: &mut TcpStream, r: &Reply) {
     head.push_str("Connection: close\r\n\r\n");
 
     let mut out = head.into_bytes();
-    out.extend_from_slice(r.body.as_bytes());
+    if with_body {
+        out.extend_from_slice(r.body.as_bytes());
+    }
     send_raw(stream, &out);
 }
 

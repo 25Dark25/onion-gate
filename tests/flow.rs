@@ -427,3 +427,12 @@ fn a_spent_memory_budget_is_a_503_not_an_oom() {
     assert!(post.starts_with("HTTP/1.1 503") && !post.contains("BACKEND"), "{}", &post[..post.len().min(120)]);
     assert_eq!(app.memory.used(), 0, "every reservation is given back");
 }
+
+#[test]
+fn head_replies_from_the_gate_have_no_body() {
+    let (port, _app) = start();
+    let out = send(port, 0x3838_3838, "HEAD", "/", None, None);
+    assert!(out.starts_with("HTTP/1.1 200"), "{}", &out[..out.len().min(80)]);
+    assert!(out.ends_with("\r\n\r\n"), "a HEAD response must stop after the headers");
+    assert!(out.contains("Content-Length: ") && !out.contains("Content-Length: 0\r\n"), "it keeps the GET length");
+}

@@ -73,6 +73,12 @@ pub struct Metrics {
     pub upstream_too_large: Counter,
     /// Time spent waiting for the backend, in microseconds, over all forwards.
     pub upstream_micros: Counter,
+    /// Requests for the site without a valid pass (adaptive mode's main signal).
+    pub arrivals: Counter,
+    /// Passes issued without a CAPTCHA (adaptive mode, while calm).
+    pub free_passes: Counter,
+    /// Adaptive mode changes (calm <-> under attack).
+    pub mode_changes: Counter,
 }
 
 impl Default for Metrics {
@@ -100,6 +106,9 @@ impl Default for Metrics {
             upstream_bad_response: Counter::default(),
             upstream_too_large: Counter::default(),
             upstream_micros: Counter::default(),
+            arrivals: Counter::default(),
+            free_passes: Counter::default(),
+            mode_changes: Counter::default(),
         }
     }
 }
@@ -133,7 +142,12 @@ pub fn render(app: &App) -> String {
         ("{limit=\"conn_per_circuit\"}", m.limited_connections.get()),
         ("{limit=\"challenge\"}", m.limited_challenges.get()),
     ]);
+    family(&mut o, "arrivals_total", "counter", "Requests for the site without a valid pass.", &[("", m.arrivals.get())]);
     family(&mut o, "challenges_total", "counter", "Challenge images generated.", &[("", m.challenges.get())]);
+    family(&mut o, "free_passes_total", "counter", "Passes issued without a CAPTCHA (adaptive mode, while calm).", &[("", m.free_passes.get())]);
+    let mode = if !app.adaptive.enabled() { 2 } else if app.adaptive.calm() { 0 } else { 1 };
+    family(&mut o, "mode", "gauge", "0 = adaptive and calm (free passes), 1 = adaptive and under attack, 2 = captcha always.", &[("", mode)]);
+    family(&mut o, "mode_changes_total", "counter", "Adaptive mode changes (calm to under attack, and back).", &[("", m.mode_changes.get())]);
     family(&mut o, "verifications_total", "counter", "CAPTCHA answers, by outcome (passed = passes issued).", &[
         ("{result=\"failed\"}", m.verify_failed.get()),
         ("{result=\"next_round\"}", m.verify_next_round.get()),

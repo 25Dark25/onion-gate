@@ -17,6 +17,7 @@
 #[cfg(not(unix))]
 compile_error!("onion-gate needs a Unix-like system (Linux, macOS, BSD): it reads randomness from /dev/urandom");
 
+pub mod adaptive;
 pub mod captcha;
 pub mod config;
 /// Fuzz targets (see fuzz.rs): built for tests, or with the `fuzzing` feature
@@ -35,6 +36,7 @@ pub mod upstream;
 
 use http::{HttpError, Reply, Request};
 use config::Limits;
+use adaptive::Adaptive;
 use limit::{Limiter, Memory, Owner, Reservation};
 use metrics::Metrics;
 use rng::Rng;
@@ -81,6 +83,8 @@ pub struct App {
     pub limits: Limits,
     /// Aggregate counters (metrics.rs). No visitor data.
     pub metrics: Metrics,
+    /// Adaptive mode's state (adaptive.rs); inert with `captcha = always`.
+    pub adaptive: Adaptive,
 }
 
 impl App {
@@ -92,6 +96,7 @@ impl App {
             upstream: upstream.with_limits(limits.max_response, limits.upstream_timeout),
             proxy,
             memory: Memory::from_limits(&limits),
+            adaptive: Adaptive::new(&limits),
             limits,
             metrics: Metrics::default(),
         }
@@ -311,13 +316,13 @@ fn gated<'a>(req: &Request, circuit: Option<u32>, app: &'a App) -> Out<'a> {
     };
 
     let pass = match presented_pass(req) {
-        None => return Out::Reply(gate(app, circuit, "", ret, false)),
-        Some(None) => return Out::Reply(gate(app, circuit, "", ret, true)),
+        None => return Out::Reply(arrival(app, circuit, ret, false)),
+        Some(None) => return Out::Reply(arrival(app, circuit, ret, true)),
         Some(Some(t)) => t,
     };
     match app.store.use_pass(&pass) {
         PassUse::Ok => {}
-        PassUse::Invalid => return Out::Reply(gate(app, circuit, "", ret, true)),
+        PassUse::Invalid => return Out::Reply(arrival(app, circuit, ret, true)),
         PassUse::Exhausted => {
             app.metrics.revoked_pass_budget.inc();
             return Out::Reply(gate(app, circuit, MSG_RATE, ret, true));
@@ -355,6 +360,36 @@ fn gated<'a>(req: &Request, circuit: Option<u32>, app: &'a App) -> Out<'a> {
             Out::Reply(Reply::page(e.status(), html::message(msg)))
         }
     }
+}
+
+/// A request for the site without a valid pass: the challenge, or, in
+/// adaptive mode while calm, a free pass. A pass that spent its budget does
+/// not come here: it always gets the challenge.
+fn arrival(app: &App, circuit: Option<u32>, ret: String, clear: bool) -> Reply {
+    app.metrics.arrivals.inc();
+    if app.adaptive.calm() {
+        free_pass(app, circuit, ret)
+    } else {
+        gate(app, circuit, "", ret, clear)
+    }
+}
+
+/// A pass without a CAPTCHA and a 303 back to the same URL. It costs a
+/// challenge permit of the circuit, like an image would; if free passes have
+/// filled their half of the store, the visitor gets the challenge instead.
+fn free_pass(app: &App, circuit: Option<u32>, ret: String) -> Reply {
+    if !challenge_allowed(app, circuit) {
+        return too_many();
+    }
+    let pass = Rng::new().token();
+    if !app.store.add_free_pass(pass) {
+        app.metrics.store_full.inc();
+        return gate(app, None, "", ret, false); // permit already taken
+    }
+    app.metrics.free_passes.inc();
+    let mut r = Reply::redirect(ret);
+    r.extra.push(("Set-Cookie", pass_cookie(&pass)));
+    r
 }
 
 /// Serves a challenge in place (200). `clear` deletes a dead pass cookie.

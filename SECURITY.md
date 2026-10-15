@@ -13,6 +13,7 @@ Use **Security → Advisories → Report a vulnerability** on the repository pag
 - The pass cookie, or anything identifying the visitor, reaching the backend.
 - Getting around the per-pass or per-circuit limits from a single circuit, or unbounded memory or CPU use caused by one circuit.
 - onion-gate listening on anything but `127.0.0.1`, or connecting to a non-loopback upstream.
+- The metrics (`metrics_port`) revealing anything about an individual visitor or request.
 - Misleading claims in the code or documentation.
 
 ## Out of scope

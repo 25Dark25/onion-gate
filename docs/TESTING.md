@@ -2,9 +2,11 @@
 
 Three layers, from cheapest to most realistic:
 
-1. **`cargo test`** — unit tests and end-to-end tests over loopback sockets
-   (`tests/flow.rs`). They solve the CAPTCHA by reading the server's own state,
-   so they cover the whole flow, including forwarding and the budgets.
+1. **`cargo test`** — unit tests, end-to-end tests over loopback sockets
+   (`tests/flow.rs`) and a small fuzzer over the parsers (`src/fuzz.rs`, see
+   [Fuzzing](#fuzzing)). The end-to-end tests solve the CAPTCHA by reading the
+   server's own state, so they cover the whole flow, including forwarding and
+   the budgets.
 2. **The local harness** (`scripts/harness.sh`) — the real binaries as separate
    processes, a test backend, and curl or a browser. No tor needed.
 3. **Tor Browser at the Safest level** against a real `.onion` — the only test
@@ -90,6 +92,84 @@ that the pass is revoked and its cookie cleared.
 Tor Browser cannot use the `127.0.0.1` addresses: it sends everything through
 tor, so loopback addresses are not reachable from it. For Tor Browser, put the
 stack behind a real onion service.
+
+## Fuzzing
+
+The parsers are what a visitor (and a backend) can feed arbitrary bytes to, so
+they are fuzzed against **properties**, not just for crashes. The targets are
+in `src/fuzz.rs`:
+
+| Target | Input | Property |
+| --- | --- | --- |
+| `request` | a request head | what the parser accepts is well-formed, and the request the gate would forward is accepted by the same strict parser, framed exactly (no byte left over for a second request), with one `Host` and `Connection: close`, and without the pass cookie, client-identity or hop-by-hop headers (the list is written out in the target, not taken from the code it checks) |
+| `response` | a backend response | the re-framed response has no control bytes in any line (no response splitting), a valid status line, one `Content-Length` and no `Transfer-Encoding`, a body of exactly that length, and re-framing it again changes nothing |
+| `chunks` | a chunked body | walking it as it arrives, in pieces, gives the same result and bytes as walking it whole |
+| `proxy_line`, `cookies`, `return_path` | a PROXY line, a `Cookie` value, a request target | no panic; the pass cookie never survives `cookie_without`; the return path is never an open redirect |
+
+### In `cargo test`
+
+A deterministic, std-only mutation fuzzer runs every target 20 000 times on
+each `cargo test` (well under a second). It has no coverage feedback, so it is
+a regression net, not a substitute for the real thing. To run it longer or with
+other random choices:
+
+```bash
+FUZZ_ITERS=3000000 FUZZ_SEED=7 cargo test --release --lib fuzz
+```
+
+A failure prints the target, the seed and the input.
+
+### With libFuzzer (outside the repository)
+
+The `fuzzing` feature exposes the same targets to a coverage-guided fuzzer. It
+adds no dependency to onion-gate: the fuzzer crate lives in a directory of its
+own, outside this repository, and depends on onion-gate by path. With
+[cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) (it needs a nightly
+toolchain):
+
+```bash
+mkdir -p ~/og-fuzz/fuzz_targets && cd ~/og-fuzz
+cat > Cargo.toml <<'TOML'
+[package]
+name = "og-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+onion-gate = { path = "/path/to/onion-gate", features = ["fuzzing"] }
+
+[workspace]
+TOML
+for t in request response chunks proxy_line cookies return_path; do
+  printf '#![no_main]\nlibfuzzer_sys::fuzz_target!(|data: &[u8]| onion_gate::fuzz::%s(data));\n' "$t" > "fuzz_targets/$t.rs"
+  printf '\n[[bin]]\nname = "%s"\npath = "fuzz_targets/%s.rs"\ntest = false\ndoc = false\nbench = false\n' "$t" "$t" >> Cargo.toml
+done
+cargo +nightly fuzz run --fuzz-dir . request -- -max_total_time=900
+```
+
+For `response` and `chunks`, the first byte of each input is not part of the
+message: it selects a HEAD request (odd) or the size of the pieces.
+
+### What fuzzing has found
+
+- A backend status code outside 100–599 (`000`, `999`) was relayed to the
+  visitor as an invalid status line (`HTTP/1.1 0 OK`); it is now a `502`.
+  Found by the in-repo fuzzer in under a second.
+- libFuzzer found that a backend header literally named `close` is relayed and
+  then, on a second pass, removed as hop-by-hop (named by the gate's own
+  `Connection: close`). Harmless; the property was adjusted and the input kept
+  as a seed.
+
+The properties were checked by breaking the code on purpose (mutation
+testing): eight realistic defects — forwarding `X-Forwarded-*`, a header named
+in `Connection` or the pass cookie, an off-by-one `Content-Length`, accepting
+`Transfer-Encoding` or two `Host` headers, relaying control bytes, and an
+off-by-one in the chunk-size line cap — were each caught by `cargo test`.
 
 ## Tor Browser checklist
 

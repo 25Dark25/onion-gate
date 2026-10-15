@@ -220,6 +220,7 @@ src/upstream.rs  the reverse proxy: forward to the loopback backend, relay the r
 src/html.rs      the CAPTCHA page and error pages, base64
 src/png.rs       PNG encoder
 src/rng.rs       randomness from /dev/urandom
+src/fuzz.rs      fuzz targets for the parsers (tests, and the `fuzzing` feature for libFuzzer)
 tests/flow.rs    end-to-end tests over real sockets (gate, forwarding, limits, no open redirect)
 examples/        local test harness: a test backend and a stand-in for tor's PROXY line
 scripts/         harness.sh: automated checks against the real binaries, and a stack for a browser
@@ -307,7 +308,7 @@ Be honest with yourself about what this is:
 This project was developed with the help of Claude (Anthropic) and directed, tested and published by its author. Treat it like any unaudited security code: read `src/`, run the tests, and judge it by what can be verified rather than by who wrote it.
 
 ```bash
-cargo test --offline                              # unit + end-to-end tests
+cargo test --offline                              # unit + end-to-end tests, and a short fuzz run
 cargo clippy --offline --all-targets -- -D warnings
 cargo build --release --offline
 scripts/harness.sh check                          # the real binaries over sockets (needs curl >= 8.2)

@@ -17,6 +17,12 @@ categories = ["web-programming", "network-programming"]
 #  - a small, self-contained binary.
 [dependencies]
 
+[features]
+# Exposes the fuzz targets (src/fuzz.rs) to an external coverage-guided fuzzer,
+# which lives outside this repository. Adds no dependency and nothing to the
+# gate itself.
+fuzzing = []
+
 [lib]
 name = "onion_gate"
 path = "src/lib.rs"

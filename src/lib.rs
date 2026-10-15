@@ -18,6 +18,11 @@
 compile_error!("onion-gate needs a Unix-like system (Linux, macOS, BSD): it reads randomness from /dev/urandom");
 
 pub mod captcha;
+/// Fuzz targets (see fuzz.rs): built for tests, or with the `fuzzing` feature
+/// for an external fuzzer. Not part of the gate.
+#[cfg(any(test, feature = "fuzzing"))]
+#[doc(hidden)]
+pub mod fuzz;
 pub mod html;
 pub mod http;
 pub mod limit;

@@ -54,7 +54,9 @@ jobs:
         run: scripts/harness.sh check
       - name: Clippy (no warnings)
         if: matrix.rust == 'stable'
-        run: cargo clippy --locked --offline --all-targets -- -D warnings
+        run: |
+          cargo clippy --locked --offline --all-targets -- -D warnings
+          cargo clippy --locked --offline --all-targets --features fuzzing -- -D warnings
       - run: cargo build --release --locked --offline
 
   # Single stable check for the branch ruleset: it fails if any matrix job failed or was cancelled.

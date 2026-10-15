@@ -25,7 +25,7 @@ pub mod store;
 pub mod upstream;
 
 use http::{HttpError, Reply, Request};
-use limit::{Limiter, Memory, Reservation};
+use limit::{Limiter, Memory, Owner, Reservation};
 use rng::Rng;
 use std::net::TcpStream;
 use store::{PassUse, Store, Token};
@@ -160,8 +160,9 @@ pub fn serve_connection(stream: &mut TcpStream, app: &App) {
     let req = http::read_head(stream, initial).and_then(|p| {
         head_request = p.req.method == "HEAD";
         let cl = p.content_length.unwrap_or(0);
-        if may_forward(&p.req, app) {
-            let held = body_mem.insert(app.memory.reserve(0).ok_or(HttpError::Busy)?);
+        if let Some(pass) = may_forward(&p.req, app) {
+            let owners = owners(circuit, &pass);
+            let held = body_mem.insert(app.memory.reserve_for(&owners, 0).ok_or(HttpError::Busy)?);
             p.read_body(stream, app.max_body, Some(held))
         } else if cl <= GATE_MAX_BODY {
             p.read_body(stream, GATE_MAX_BODY, None)
@@ -208,9 +209,19 @@ fn presented_pass(req: &Request) -> Option<Option<Token>> {
 }
 
 /// Could this request reach the backend? Only then is its whole body worth
-/// reading. Checked again (and charged) when it is routed.
-fn may_forward(req: &Request, app: &App) -> bool {
-    !in_gate_namespace(&req.path) && matches!(presented_pass(req), Some(Some(t)) if app.store.pass_alive(&t))
+/// reading. Checked again (and charged) when it is routed. Returns the pass.
+fn may_forward(req: &Request, app: &App) -> Option<Token> {
+    if in_gate_namespace(&req.path) {
+        return None;
+    }
+    presented_pass(req).flatten().filter(|t| app.store.pass_alive(t))
+}
+
+/// Whose shares of the memory budget a forwarded request is charged to.
+fn owners(circuit: Option<u32>, pass: &Token) -> Vec<Owner> {
+    let mut v = vec![Owner::Pass(*pass)];
+    v.extend(circuit.map(Owner::Circuit));
+    v
 }
 
 /// Routes one parsed request.
@@ -275,7 +286,7 @@ fn gated<'a>(req: &Request, circuit: Option<u32>, app: &'a App) -> Out<'a> {
     }
 
     // Valid pass: forward to the backend.
-    match app.upstream.forward(req, &app.memory) {
+    match app.upstream.forward(req, &app.memory, &owners(circuit, &pass)) {
         Ok((bytes, held)) => Out::Raw(bytes, held),
         Err(upstream::ProxyError::Busy) => Out::Reply(Reply::page(503, html::message(MSG_BUSY))),
         Err(e) => Out::Reply(Reply::page(e.status(), html::message(MSG_GATEWAY))),

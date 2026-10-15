@@ -17,7 +17,6 @@
 //! Policy: when in doubt, deny (fail-closed).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -222,27 +221,82 @@ impl Limiter {
 /// files in parallel could exhaust the process's memory. Over the budget, the
 /// visitor gets a 503 instead.
 pub const MAX_BUFFERED: usize = 128 * 1024 * 1024;
+/// The most one Tor circuit may hold of that budget. Without it, one circuit's
+/// 8 connections, each holding a large response for a slow reader, could take
+/// half the budget. 24 MiB fits one maximal response (8 MiB, counted twice
+/// while it is re-framed) next to a page's ordinary assets.
+pub const MAX_BUFFERED_PER_CIRCUIT: usize = 24 * 1024 * 1024;
+/// The most one pass may hold, whatever circuits it is used from (a pass is not
+/// bound to a circuit). Filling the whole budget then takes at least
+/// MAX_BUFFERED / MAX_BUFFERED_PER_PASS passes, each a solved CAPTCHA.
+pub const MAX_BUFFERED_PER_PASS: usize = 32 * 1024 * 1024;
+const _: () = assert!(MAX_BUFFERED_PER_CIRCUIT <= MAX_BUFFERED_PER_PASS);
+const _: () = assert!(MAX_BUFFERED_PER_PASS < MAX_BUFFERED);
 
-/// A shared byte budget. Reservations give their bytes back when dropped.
+/// Who a reservation is charged to, besides the global budget.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Owner {
+    Circuit(u32),
+    Pass([u8; 16]),
+}
+
+struct MemInner {
+    used: usize,
+    /// Bytes held per owner; an owner holding nothing has no entry, so the map
+    /// never holds more entries than there are live reservations (x2).
+    per: HashMap<Owner, usize>,
+}
+
+/// A shared byte budget, with a share per circuit and per pass. Reservations
+/// give their bytes back when dropped.
 pub struct Memory {
-    used: AtomicUsize,
+    inner: Mutex<MemInner>,
     max: usize,
+    max_circuit: usize,
+    max_pass: usize,
 }
 
 impl Default for Memory {
     fn default() -> Self {
-        Self::new(MAX_BUFFERED)
+        Self::with_shares(MAX_BUFFERED, MAX_BUFFERED_PER_CIRCUIT, MAX_BUFFERED_PER_PASS)
     }
 }
 
 impl Memory {
+    /// A budget of `max` bytes with the default per-circuit and per-pass shares.
     pub fn new(max: usize) -> Memory {
-        Memory { used: AtomicUsize::new(0), max }
+        Self::with_shares(max, MAX_BUFFERED_PER_CIRCUIT, MAX_BUFFERED_PER_PASS)
     }
 
-    /// Reserves `n` bytes. None = the budget would be exceeded.
+    pub fn with_shares(max: usize, max_circuit: usize, max_pass: usize) -> Memory {
+        Memory {
+            inner: Mutex::new(MemInner { used: 0, per: HashMap::new() }),
+            max,
+            max_circuit,
+            max_pass,
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, MemInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn cap(&self, o: &Owner) -> usize {
+        match o {
+            Owner::Circuit(_) => self.max_circuit,
+            Owner::Pass(_) => self.max_pass,
+        }
+    }
+
+    /// Reserves `n` bytes charged to the global budget only. None = over budget.
     pub fn reserve(&self, n: usize) -> Option<Reservation<'_>> {
-        let mut r = Reservation { mem: self, bytes: 0 };
+        self.reserve_for(&[], n)
+    }
+
+    /// Reserves `n` bytes charged to the global budget and to each owner's
+    /// share. None = some limit would be exceeded.
+    pub fn reserve_for(&self, owners: &[Owner], n: usize) -> Option<Reservation<'_>> {
+        let mut r = Reservation { mem: self, bytes: 0, owners: owners.to_vec() };
         if r.grow(n) {
             Some(r)
         } else {
@@ -252,7 +306,28 @@ impl Memory {
 
     /// Bytes currently reserved.
     pub fn used(&self) -> usize {
-        self.used.load(Ordering::SeqCst)
+        self.lock().used
+    }
+
+    /// Bytes currently held by one owner.
+    pub fn used_by(&self, o: Owner) -> usize {
+        self.lock().per.get(&o).copied().unwrap_or(0)
+    }
+
+    fn release(&self, owners: &[Owner], n: usize) {
+        if n == 0 {
+            return;
+        }
+        let mut g = self.lock();
+        g.used = g.used.saturating_sub(n);
+        for o in owners {
+            if let Some(v) = g.per.get_mut(o) {
+                *v = v.saturating_sub(n);
+                if *v == 0 {
+                    g.per.remove(o);
+                }
+            }
+        }
     }
 }
 
@@ -260,28 +335,33 @@ impl Memory {
 pub struct Reservation<'a> {
     mem: &'a Memory,
     bytes: usize,
+    owners: Vec<Owner>,
 }
 
 impl Reservation<'_> {
-    /// Adds `n` bytes to the reservation. false = over budget (nothing added).
+    /// Adds `n` bytes to the reservation. false = over the global budget or an
+    /// owner's share (nothing added).
     pub fn grow(&mut self, n: usize) -> bool {
-        // An explicit CAS loop: `fetch_update` is deprecated in recent Rust and
-        // its replacement does not exist in the minimum supported version.
-        let used = &self.mem.used;
-        let mut cur = used.load(Ordering::SeqCst);
-        loop {
-            let next = match cur.checked_add(n) {
-                Some(t) if t <= self.mem.max => t,
-                _ => return false,
-            };
-            match used.compare_exchange_weak(cur, next, Ordering::SeqCst, Ordering::SeqCst) {
-                Ok(_) => {
-                    self.bytes += n;
-                    return true;
-                }
-                Err(actual) => cur = actual,
+        if n == 0 {
+            return true;
+        }
+        let mem = self.mem;
+        let mut g = mem.lock();
+        let fits = |held: usize, cap: usize| held.checked_add(n).is_some_and(|t| t <= cap);
+        if !fits(g.used, mem.max) {
+            return false;
+        }
+        for o in &self.owners {
+            if !fits(g.per.get(o).copied().unwrap_or(0), mem.cap(o)) {
+                return false;
             }
         }
+        g.used += n;
+        for o in &self.owners {
+            *g.per.entry(*o).or_insert(0) += n;
+        }
+        self.bytes += n;
+        true
     }
 
     /// Bytes this reservation holds.
@@ -292,7 +372,7 @@ impl Reservation<'_> {
     /// Gives back everything above `n` bytes.
     pub fn shrink_to(&mut self, n: usize) {
         if n < self.bytes {
-            self.mem.used.fetch_sub(self.bytes - n, Ordering::SeqCst);
+            self.mem.release(&self.owners, self.bytes - n);
             self.bytes = n;
         }
     }
@@ -300,7 +380,7 @@ impl Reservation<'_> {
 
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
-        self.mem.used.fetch_sub(self.bytes, Ordering::SeqCst);
+        self.mem.release(&self.owners, self.bytes);
     }
 }
 
@@ -323,6 +403,23 @@ mod tests {
         drop(a);
         assert_eq!(m.used(), 0);
         assert!(m.reserve(usize::MAX).is_none(), "no overflow");
+    }
+
+    #[test]
+    fn circuit_and_pass_shares_cap_one_owner() {
+        let m = Memory::with_shares(1000, 100, 150);
+        let (c1, c2, p) = (Owner::Circuit(1), Owner::Circuit(2), Owner::Pass([7; 16]));
+        let a = m.reserve_for(&[c1, p], 100).expect("fits the circuit share");
+        assert!(m.reserve_for(&[c1], 1).is_none(), "circuit 1 is at its share");
+        // the same pass from another circuit: limited by the pass share
+        let b = m.reserve_for(&[c2, p], 50).expect("pass has 50 left");
+        assert!(m.reserve_for(&[c2, p], 1).is_none(), "pass is at its share");
+        // another pass on circuit 2 is fine
+        let c = m.reserve_for(&[c2, Owner::Pass([8; 16])], 50).expect("other owners are unaffected");
+        assert_eq!((m.used(), m.used_by(c1), m.used_by(c2), m.used_by(p)), (200, 100, 100, 150));
+        drop((a, b, c));
+        assert_eq!((m.used(), m.used_by(c1), m.used_by(p)), (0, 0, 0));
+        assert!(m.lock().per.is_empty(), "no entry is kept for owners holding nothing");
     }
 
     #[test]

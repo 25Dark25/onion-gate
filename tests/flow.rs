@@ -5,7 +5,7 @@
 
 use onion_gate::store::{from_hex, to_hex, Store, Token};
 use onion_gate::upstream::Upstream;
-use onion_gate::limit::Memory;
+use onion_gate::limit::{Memory, Owner, MAX_BUFFERED_PER_CIRCUIT};
 use onion_gate::{captcha, limit::Limiter, serve_connection, App, COOKIE, ROUNDS};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
@@ -468,4 +468,21 @@ fn head_replies_from_the_gate_have_no_body() {
     assert!(out.starts_with("HTTP/1.1 200"), "{}", &out[..out.len().min(80)]);
     assert!(out.ends_with("\r\n\r\n"), "a HEAD response must stop after the headers");
     assert!(out.contains("Content-Length: ") && !out.contains("Content-Length: 0\r\n"), "it keeps the GET length");
+}
+
+#[test]
+fn one_circuit_cannot_hold_more_than_its_share_of_the_budget() {
+    let (port, app) = start();
+    let (c, other) = (0x4040_4040, 0x4141_4141);
+    let pass = pass_for(port, app.as_ref(), c);
+    // Stand in for slow readers on circuit `c` holding its whole share.
+    let held = app.memory.reserve_for(&[Owner::Circuit(c)], MAX_BUFFERED_PER_CIRCUIT).unwrap();
+    let r = send(port, c, "GET", "/a", Some(&pass), None);
+    assert!(r.starts_with("HTTP/1.1 503") && !r.contains("BACKEND"), "{}", &r[..r.len().min(120)]);
+    // the rest of the budget still serves other circuits, even with the same pass
+    let r = send(port, other, "GET", "/b", Some(&pass), None);
+    assert!(r.starts_with("HTTP/1.1 200") && r.contains("target=/b"), "{}", &r[..r.len().min(120)]);
+    drop(held);
+    let r = send(port, c, "GET", "/c", Some(&pass), None);
+    assert!(r.starts_with("HTTP/1.1 200"), "{}", &r[..r.len().min(120)]);
 }

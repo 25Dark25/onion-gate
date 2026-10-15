@@ -127,6 +127,11 @@ impl Upstream {
         };
         let framed = frame_response(&raw, head_only)?;
         drop(raw);
+        // The re-framed reply of a tiny response can exceed the 2x reserved
+        // (our own Content-Length and Connection headers): charge the rest.
+        if framed.len() > held.bytes() && !held.grow(framed.len() - held.bytes()) {
+            return Err(ProxyError::Busy);
+        }
         held.shrink_to(framed.len());
         Ok((framed, held))
     }
@@ -518,7 +523,8 @@ fn walk_chunks(data: &[u8], pos: &mut usize, mut each: impl FnMut(&[u8])) -> Wal
         let nl = match find_crlf(data, *pos) {
             Some(nl) if nl <= MAX_CHUNK_LINE => nl,
             Some(_) => return Walk::Bad,
-            None if data.len() - (*pos).min(data.len()) > MAX_CHUNK_LINE => return Walk::Bad,
+            // A line of MAX_CHUNK_LINE bytes may still be waiting for its CRLF.
+            None if data.len() - (*pos).min(data.len()) > MAX_CHUNK_LINE + 1 => return Walk::Bad,
             None => return Walk::More,
         };
         let size = match chunk_size(&data[*pos..*pos + nl]) {
@@ -534,6 +540,8 @@ fn walk_chunks(data: &[u8], pos: &mut usize, mut each: impl FnMut(&[u8])) -> Wal
                     return Walk::Bad;
                 }
                 match find_crlf(data, t) {
+                    // One endless trailer line must hit the cap too.
+                    None if data.len() - t > MAX_TRAILERS => return Walk::Bad,
                     None => return Walk::More,
                     Some(0) => return Walk::Done,
                     Some(n) => t += n + 2,
@@ -689,6 +697,17 @@ mod tests {
         assert_eq!(walk(b"zzzz\r\n").0, Walk::Bad);
         assert_eq!(walk(b"2\r\nhiX\r\n0\r\n\r\n").0, Walk::Bad, "data not followed by CRLF");
         assert_eq!(walk(&[b'1'; MAX_CHUNK_LINE + 10]).0, Walk::Bad, "endless size line");
+        // a size line of exactly MAX_CHUNK_LINE bytes is fine whether or not its
+        // CRLF has fully arrived yet
+        let mut line = vec![b'0'; MAX_CHUNK_LINE - 1];
+        line.push(b'1');
+        assert_eq!(walk(&line).0, Walk::More);
+        line.push(b'\r');
+        assert_eq!(walk(&line).0, Walk::More);
+        // an endless trailer line is refused, not rescanned forever
+        let mut t = b"0\r\n".to_vec();
+        t.extend(vec![b'a'; MAX_TRAILERS + 10]);
+        assert_eq!(walk(&t).0, Walk::Bad);
         // a truncated response is refused when framed
         assert!(frame_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhi", false).is_err());
         assert!(frame_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", false).is_err(), "chunked twice");
@@ -839,6 +858,33 @@ mod tests {
         assert_eq!(mem.used(), 0);
     }
 
+    /// The backend answers 413, half-closes and drains the rest: its answer
+    /// arrives before the gate has finished sending the body.
+    #[test]
+    fn an_answer_sent_before_the_body_was_read_is_relayed() {
+        use std::net::{Ipv4Addr, TcpListener};
+        let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = l.accept() {
+                let mut buf = [0u8; 64 * 1024];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n");
+                let _ = s.shutdown(std::net::Shutdown::Write);
+                while matches!(s.read(&mut buf), Ok(n) if n > 0) {}
+            }
+        });
+        let up = Upstream::new(&addr, "p").unwrap();
+        let big = req("POST", vec![("Host", "h")], &vec![b'x'; 1024 * 1024]);
+        let mem = Memory::default();
+        let (bytes, _held) = up.forward(&big, &mem).expect("the 413 is relayed");
+        assert!(String::from_utf8_lossy(&bytes).starts_with("HTTP/1.1 413"));
+    }
+
+    /// Same, but the backend closes without reading the body, so the gate's
+    /// write fails with a reset. Linux keeps the bytes received before the
+    /// reset readable; other systems may discard them, hence Linux only.
+    #[cfg(target_os = "linux")]
     #[test]
     fn an_early_answer_is_relayed_even_if_the_backend_stopped_reading() {
         // The backend answers 413 and closes without reading a large body.

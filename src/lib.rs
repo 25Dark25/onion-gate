@@ -153,38 +153,34 @@ pub fn serve_connection(stream: &mut TcpStream, app: &App) {
         None => None,
     };
 
-    // The body's memory (twice: it is copied into the forwarded request) is
-    // held until the reply has been sent.
+    // The body's memory is charged as it arrives and held until the reply has
+    // been sent.
     let mut body_mem: Option<Reservation<'_>> = None;
+    let mut head_request = false;
     let req = http::read_head(stream, initial).and_then(|p| {
+        head_request = p.req.method == "HEAD";
         let cl = p.content_length.unwrap_or(0);
         if may_forward(&p.req, app) {
-            if cl > app.max_body {
-                return Err(http::HttpError::TooLarge);
-            }
-            match app.memory.reserve(cl.saturating_mul(2)) {
-                Some(r) => body_mem = Some(r),
-                None => return Err(http::HttpError::Busy),
-            }
-            p.read_body(stream, app.max_body)
+            let held = body_mem.insert(app.memory.reserve(0).ok_or(HttpError::Busy)?);
+            p.read_body(stream, app.max_body, Some(held))
         } else if cl <= GATE_MAX_BODY {
-            p.read_body(stream, GATE_MAX_BODY)
+            p.read_body(stream, GATE_MAX_BODY, None)
         } else {
             Ok(p.skip_body())
         }
     });
     match req {
         Ok(req) => match route(&req, circuit, app) {
-            Out::Reply(r) if req.method == "HEAD" => http::send_head(stream, &r),
+            Out::Reply(r) if head_request => http::send_head(stream, &r),
             Out::Reply(r) => http::send(stream, &r),
             // A relayed HEAD response is already body-less (upstream.rs).
             Out::Raw(bytes, _held) => http::send_raw(stream, &bytes),
         },
-        Err(e) => {
-            if let Some(reply) = error_reply(&e) {
-                http::send(stream, &reply);
-            }
-        }
+        Err(e) => match error_reply(&e) {
+            Some(reply) if head_request => http::send_head(stream, &reply),
+            Some(reply) => http::send(stream, &reply),
+            None => {}
+        },
     }
     http::close(stream);
 }

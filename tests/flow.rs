@@ -425,7 +425,40 @@ fn a_spent_memory_budget_is_a_503_not_an_oom() {
     assert!(get.starts_with("HTTP/1.1 503") && !get.contains("BACKEND"), "{}", &get[..get.len().min(120)]);
     let post = send(port, c, "POST", "/", Some(&pass), Some(&"x".repeat(80)));
     assert!(post.starts_with("HTTP/1.1 503") && !post.contains("BACKEND"), "{}", &post[..post.len().min(120)]);
+    assert_budget_released(&app);
+}
+
+/// The server thread gives its reservation back after closing the connection
+/// (which may drain for up to 500 ms), so the client can be done first.
+fn assert_budget_released(app: &App) {
+    let t0 = std::time::Instant::now();
+    while app.memory.used() != 0 && t0.elapsed() < Duration::from_secs(3) {
+        thread::sleep(Duration::from_millis(20));
+    }
     assert_eq!(app.memory.used(), 0, "every reservation is given back");
+}
+
+#[test]
+fn a_declared_body_that_never_arrives_reserves_nothing() {
+    // Budget 4096. A pass holder declares a 1900-byte body and sends none of it:
+    // were it reserved upfront (2 x 1900), the next forwarded request would not
+    // fit and get a 503.
+    let (port, app) = start_custom(false, Memory::new(4096));
+    let c = 0x3939_3939;
+    let pass = pass_for(port, app.as_ref(), c);
+    let mut hanging = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+    let head = format!(
+        "{}POST /upload HTTP/1.1\r\nHost: t.onion\r\nCookie: {}={}\r\nContent-Length: 1900\r\n\r\n",
+        proxy_line(c),
+        COOKIE,
+        pass
+    );
+    hanging.write_all(head.as_bytes()).unwrap();
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(app.memory.used(), 0, "nothing arrived, nothing is held");
+    let r = send(port, c, "GET", "/ok", Some(&pass), None);
+    assert!(r.starts_with("HTTP/1.1 200") && r.contains("target=/ok"), "{}", &r[..r.len().min(120)]);
+    drop(hanging);
 }
 
 #[test]

@@ -278,6 +278,11 @@ impl Reservation<'_> {
         ok
     }
 
+    /// Bytes this reservation holds.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
     /// Gives back everything above `n` bytes.
     pub fn shrink_to(&mut self, n: usize) {
         if n < self.bytes {

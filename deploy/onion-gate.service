@@ -35,8 +35,10 @@ IPAddressAllow=localhost
 IPAddressDeny=any
 # One thread per connection: MAX_CONN (512) plus the main thread, with margin.
 TasksMax=520
-# Worst case is about 300 MiB: 128 MiB of buffered bodies (MAX_BUFFERED), up to
-# ~130 MiB of challenge images being drawn at once, and the bounded stores.
+# Worst case is roughly 300 MiB: 128 MiB of buffered bodies (MAX_BUFFERED, an
+# approximate count: allocator slack is not included), about 120 MiB if all 512
+# connections draw a challenge image at once (~240 KiB each), and the bounded
+# stores.
 # Over this, systemd kills the service and every pass is lost, so keep it above
 # that sum if you raise any of those limits.
 MemoryMax=512M

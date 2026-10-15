@@ -18,6 +18,7 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, TcpStream};
+use crate::limit::Reservation;
 use std::time::{Duration, Instant};
 
 const MAX_HEAD: usize = 16 * 1024;
@@ -228,7 +229,15 @@ pub struct PendingBody {
 
 impl PendingBody {
     /// Reads the body. More than `max_body` declared => TooLarge, nothing read.
-    pub fn read_body(self, stream: &mut TcpStream, max_body: usize) -> Result<Request, HttpError> {
+    /// With `mem`, every byte that arrives is charged to it (twice: the body is
+    /// copied into the forwarded request) as it arrives, never upfront, so a
+    /// declared length that is never sent costs nothing. Over budget => Busy.
+    pub fn read_body(
+        self,
+        stream: &mut TcpStream,
+        max_body: usize,
+        mut mem: Option<&mut Reservation<'_>>,
+    ) -> Result<Request, HttpError> {
         let PendingBody { mut req, content_length, rest } = self;
         let cl = match content_length {
             Some(cl) => cl,
@@ -237,7 +246,19 @@ impl PendingBody {
         if cl > max_body {
             return Err(HttpError::TooLarge);
         }
+        let mut charge = |n: usize| match mem.as_deref_mut() {
+            Some(r) => {
+                if r.grow(n.saturating_mul(2)) {
+                    Ok(())
+                } else {
+                    Err(HttpError::Busy)
+                }
+            }
+            None => Ok(()),
+        };
         let mut body = rest;
+        body.truncate(cl);
+        charge(body.len())?;
         let mut chunk = [0u8; 1024];
         let body_deadline = Instant::now() + BODY_DEADLINE;
         while body.len() < cl {
@@ -245,9 +266,10 @@ impl PendingBody {
             if n == 0 {
                 return Err(HttpError::Closed);
             }
+            let n = n.min(cl - body.len()); // anything extra (pipelining) is discarded
+            charge(n)?;
             body.extend_from_slice(&chunk[..n]);
         }
-        body.truncate(cl); // anything extra (pipelining) is discarded
         req.body = body;
         Ok(req)
     }
@@ -263,7 +285,7 @@ impl PendingBody {
 /// Reads one HTTP request. `initial` holds bytes already read (whatever followed
 /// the PROXY line, or nothing). `max_body` caps the request body.
 pub fn read_request(stream: &mut TcpStream, initial: Vec<u8>, max_body: usize) -> Result<Request, HttpError> {
-    read_head(stream, initial)?.read_body(stream, max_body)
+    read_head(stream, initial)?.read_body(stream, max_body, None)
 }
 
 /// Reads and validates the request line and headers, but not the body.

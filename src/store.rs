@@ -5,7 +5,7 @@
 //!    attempt, whether it succeeds or fails. No retries on the same token.
 //!  - Strict expiry (CHALLENGE_TTL + GRACE), checked on every use.
 //!  - Each challenge carries the path to return to once the CAPTCHA is passed.
-//!    It is the sanitized request path (see `gate::safe_return_path`): always a
+//!    It is the sanitized request path (see `safe_return_path` in lib.rs): always a
 //!    same-origin absolute path, so it can never become an open redirect. It is
 //!    stored here, bound to the token, never echoed through the client.
 //!  - A pass dies after PASS_IDLE without use or PASS_MAX after it was issued,
@@ -50,7 +50,7 @@ pub struct Pending {
     /// Rounds still to pass, including this challenge's (>= 1).
     pub rounds_left: u8,
     /// Where to send the visitor after the last round: a sanitized, same-origin
-    /// absolute path (see `gate::safe_return_path`).
+    /// absolute path (see `safe_return_path` in lib.rs).
     pub ret: String,
     expires: Instant,
 }

@@ -121,7 +121,7 @@ impl Reply {
     }
 
     /// 303 See Other: after a POST, the browser requests `location` with GET.
-    /// `location` must be a sanitized same-origin path (see `gate`).
+    /// `location` must be a sanitized same-origin path (see `safe_return_path` in lib.rs).
     pub fn redirect(location: String) -> Reply {
         Reply {
             status: 303,

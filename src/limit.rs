@@ -9,7 +9,7 @@
 //!  - challenges generated per circuit (token bucket: stops CPU abuse and
 //!    filling the challenge store),
 //!  - site pages served per circuit (token bucket: stops one circuit from
-//!    hammering the site with several passes; see main.rs for what happens
+//!    hammering the site with several passes; see `gated` in lib.rs for what happens
 //!    when it runs out).
 //!
 //! To take the service down, an attacker needs many circuits, and every new

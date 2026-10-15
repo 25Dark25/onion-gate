@@ -10,6 +10,8 @@
 //! This crate is a library (the pieces) plus a thin binary (`main.rs`). The
 //! integration tests drive the same `serve_connection` the binary uses.
 
+#![forbid(unsafe_code)]
+
 // Randomness comes from /dev/urandom (std has no portable CSPRNG), so the gate
 // needs a Unix system. Fail the build elsewhere rather than panic at run time.
 #[cfg(not(unix))]

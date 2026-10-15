@@ -95,7 +95,9 @@ deliberate: the whole point is that the visitor stays anonymous.
 - A backend that listens on a loopback address (`127.0.0.1` or `::1`).
 - For per-circuit limits: tor with `HiddenServiceExportCircuitID haproxy`
   (see [`deploy/torrc.example`](deploy/torrc.example)). Without it the gate still
-  works, but can only apply the per-pass limit.
+  works, but can only apply the per-pass limit: challenge generation (CPU) is
+  then unlimited, so run without `--proxy-protocol` for local tests only (the
+  binary warns at startup).
 
 ## Build and run
 
@@ -119,7 +121,7 @@ Flags:
 | Flag | Meaning |
 | --- | --- |
 | `[port]` | Port to listen on (loopback only). Default `8088`. |
-| `--upstream=HOST:PORT` | **Required.** The backend to protect. Must resolve to loopback. |
+| `--upstream=HOST:PORT` | **Required.** The backend to protect. Must resolve to loopback, and not to onion-gate's own port. |
 | `--proxy-protocol` | Require tor's PROXY v1 line on every connection (production). |
 | `--max-body=BYTES` | Cap on request body size (default 1 MiB). |
 

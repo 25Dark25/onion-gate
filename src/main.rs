@@ -7,7 +7,7 @@
 use onion_gate::http::DEFAULT_MAX_BODY;
 use onion_gate::upstream::Upstream;
 use onion_gate::{limit::Limiter, limit::Memory, serve_connection, store::Store, App, COOKIE};
-use std::net::{Ipv4Addr, TcpListener};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -63,6 +63,12 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<Config, String> {
     })
 }
 
+/// The gate listens on 127.0.0.1:`port` only, so that is the one upstream
+/// address that would loop back into it.
+fn points_at_self(addrs: &[SocketAddr], port: u16) -> bool {
+    addrs.iter().any(|a| a.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST) && a.port() == port)
+}
+
 struct ConnGuard;
 impl Drop for ConnGuard {
     fn drop(&mut self) {
@@ -90,6 +96,10 @@ fn main() {
             std::process::exit(1);
         }
     };
+    if points_at_self(upstream.addrs(), cfg.port) {
+        eprintln!("--upstream: {} is onion-gate's own address; point it at the backend", cfg.upstream);
+        std::process::exit(1);
+    }
 
     // The listen IP is deliberately NOT configurable: loopback only. Tor (or a
     // front such as another proxy) connects to it locally.
@@ -107,6 +117,12 @@ fn main() {
         if cfg.proxy { "yes" } else { "no" },
         cfg.max_body
     );
+    if !cfg.proxy {
+        eprintln!(
+            "warning: without --proxy-protocol there are no per-circuit limits: challenge \
+             generation is unlimited and only the per-pass budget applies. Use it behind tor"
+        );
+    }
 
     let app = Arc::new(App {
         store: Store::new(),
@@ -163,6 +179,15 @@ mod tests {
         assert!(c.proxy);
         assert_eq!(c.upstream, "127.0.0.1:3000");
         assert_eq!(c.max_body, 2048);
+    }
+
+    #[test]
+    fn upstream_on_the_gate_itself_is_detected() {
+        let a: Vec<SocketAddr> = vec!["127.0.0.1:8088".parse().unwrap()];
+        assert!(points_at_self(&a, 8088));
+        assert!(!points_at_self(&a, 9000));
+        let v6: Vec<SocketAddr> = vec!["[::1]:8088".parse().unwrap()];
+        assert!(!points_at_self(&v6, 8088), "the gate does not listen on ::1");
     }
 
     #[test]

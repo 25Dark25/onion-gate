@@ -216,21 +216,44 @@ fn no_open_redirect_through_the_return_path() {
     assert!(!done.contains("evil.onion"));
 }
 
+/// Sends `request` verbatim (after a PROXY line) and returns the response.
+fn send_raw(port: u16, circuit: u32, request: &str) -> String {
+    let mut s = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(format!("{}{}", proxy_line(circuit), request).as_bytes()).unwrap();
+    let mut out = Vec::new();
+    s.read_to_end(&mut out).unwrap();
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[test]
 fn header_smuggling_is_rejected() {
     let (port, _app) = start();
     // A bare LF inside the headers must not split into an extra header line.
-    let raw = format!(
-        "{}GET / HTTP/1.1\r\nHost: t.onion\r\nX: a\nSmuggled: 1\r\n\r\n",
-        proxy_line(0x3333_3333)
-    );
-    let mut s = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
-    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    s.write_all(raw.as_bytes()).unwrap();
-    let mut out = String::new();
-    s.read_to_string(&mut out).unwrap();
+    let out = send_raw(port, 0x3333_3333, "GET / HTTP/1.1\r\nHost: t.onion\r\nX: a\nSmuggled: 1\r\n\r\n");
     assert!(out.starts_with("HTTP/1.1 400"), "a lone LF in headers must be a 400, got:\n{}", &out[..out.len().min(80)]);
     assert!(!out.contains("BACKEND"));
+}
+
+#[test]
+fn ambiguous_requests_are_rejected_before_any_forwarding() {
+    let (port, app) = start();
+    let c = 0x3434_3434;
+    let pass = pass_for(port, app.as_ref(), c);
+    let cookie = format!("Cookie: {}={}\r\n", COOKIE, pass);
+    for (what, req) in [
+        ("a tab in the target", format!("GET /a\tHTTP/1.0 HTTP/1.1\r\nHost: t.onion\r\n{}\r\n", cookie)),
+        ("two Host headers", format!("GET / HTTP/1.1\r\nHost: t.onion\r\nHost: other\r\n{}\r\n", cookie)),
+        ("HTTP/1.1 without Host", format!("GET / HTTP/1.1\r\n{}\r\n", cookie)),
+        ("a header name that is not a token", format!("GET / HTTP/1.1\r\nHost: t.onion\r\nX(y): 1\r\n{}\r\n", cookie)),
+    ] {
+        let out = send_raw(port, c, &req);
+        assert!(out.starts_with("HTTP/1.1 400"), "{} must be a 400, got:\n{}", what, &out[..out.len().min(80)]);
+        assert!(!out.contains("BACKEND"), "{} reached the backend", what);
+    }
+    // HTTP/1.0 may omit Host: it is forwarded with one added.
+    let out = send_raw(port, c, &format!("GET /old HTTP/1.0\r\n{}\r\n", cookie));
+    assert!(out.contains("BACKEND saw target=/old"), "{}", &out[..out.len().min(120)]);
 }
 
 #[test]

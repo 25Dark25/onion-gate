@@ -332,7 +332,8 @@ fn build_request(req: &Request, pass_cookie: &str) -> Vec<u8> {
         head.push_str(value);
         head.push_str("\r\n");
     }
-    // HTTP/1.1 requires a Host header; Tor Browser always sends one, but be safe.
+    // Only an HTTP/1.0 request can arrive without Host (http.rs refuses it for
+    // 1.1); it is forwarded as HTTP/1.1, which needs one.
     if !has_host {
         head.push_str("Host: localhost\r\n");
     }

@@ -224,8 +224,9 @@ Guarantees (as far as the code goes):
   same-origin absolute path and stored server-side, never taken from a header
   the client controls.
 - **Strict HTTP:** one request per connection, `Connection: close`, no keep-alive
-  or pipelining (no request smuggling), chunked request bodies rejected, size
-  and time limits throughout.
+  or pipelining (no request smuggling), chunked request bodies rejected, header
+  names must be tokens, exactly one `Host` (HTTP/1.1), size and time limits
+  throughout.
 - **Loopback only:** listens on `127.0.0.1`; the upstream must be loopback too.
 - **No visitor data added** to forwarded requests; the pass cookie is stripped.
 - **Bounded memory** in every store.

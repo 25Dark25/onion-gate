@@ -7,7 +7,9 @@
 //!    non-numeric `Content-Length` is rejected.
 //!  - Hard limits: 16 KiB head, a configurable body cap, an 8 s deadline for
 //!    the head (anti-slowloris) and 60 s more for a body, a 2 KiB target.
-//!  - Control bytes, non-ASCII, stray CR/LF and "obs-fold" => 400.
+//!  - Control bytes, non-ASCII, stray CR/LF, "obs-fold", a header name that
+//!    is not a token, a tab in the target, and a missing (HTTP/1.1) or
+//!    repeated `Host` => 400.
 //!  - Nothing about requests is logged (no access logs).
 //!
 //! The request is parsed once. The gate reads `method`/`path` to decide what to
@@ -250,7 +252,9 @@ pub fn read_request(stream: &mut TcpStream, initial: Vec<u8>, max_body: usize) -
     if version != "HTTP/1.1" && version != "HTTP/1.0" {
         return Err(HttpError::Bad);
     }
-    if !target.starts_with('/') || target.len() > MAX_TARGET {
+    // Visible ASCII only: a tab (allowed by safe_head) would be forwarded inside
+    // the request line, where some backends split on any whitespace.
+    if !target.starts_with('/') || target.len() > MAX_TARGET || !target.bytes().all(|b| (0x21..=0x7E).contains(&b)) {
         return Err(HttpError::Bad);
     }
     if !METHODS.contains(&m) {
@@ -262,6 +266,7 @@ pub fn read_request(stream: &mut TcpStream, initial: Vec<u8>, max_body: usize) -
     // 3) headers
     let mut content_length: Option<usize> = None;
     let mut cookie: Option<String> = None;
+    let mut hosts = 0usize;
     let mut headers: Vec<(String, String)> = Vec::new();
     for line in lines {
         if line.contains('\r') || line.contains('\n') {
@@ -271,10 +276,13 @@ pub fn read_request(stream: &mut TcpStream, initial: Vec<u8>, max_body: usize) -
             return Err(HttpError::Bad); // obs-fold
         }
         let (name, value) = line.split_once(':').ok_or(HttpError::Bad)?;
-        if name.is_empty() || name.bytes().any(|b| b == b' ' || b == b'\t') {
+        if !is_token(name) {
             return Err(HttpError::Bad);
         }
         let value = value.trim_matches(|c: char| c == ' ' || c == '\t');
+        if name.eq_ignore_ascii_case("host") {
+            hosts += 1;
+        }
 
         if name.eq_ignore_ascii_case("content-length") {
             if content_length.is_some() {
@@ -290,6 +298,12 @@ pub fn read_request(stream: &mut TcpStream, initial: Vec<u8>, max_body: usize) -
             cookie = Some(value.to_string());
         }
         headers.push((name.to_string(), value.to_string()));
+    }
+
+    // RFC 9112 §3.2: an HTTP/1.1 request needs exactly one Host, and two would
+    // let the gate and the backend disagree about which site is meant.
+    if hosts > 1 || (hosts == 0 && version == "HTTP/1.1") {
+        return Err(HttpError::Bad);
     }
 
     // 4) body (only when a Content-Length is given; GET/HEAD usually have none)

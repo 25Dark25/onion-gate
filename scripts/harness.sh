@@ -32,6 +32,8 @@ BROWSER_PORT=${BROWSER_PORT:-18080}
 CHECK_BACKEND_PORT=13001
 CHECK_GATE_PORT=18089
 CHECK_METRICS_PORT=18099
+CHECK_ADAPTIVE_PORT=18091
+CHECK_ADAPTIVE_METRICS_PORT=18098
 
 PIDS=""
 PASSED=0
@@ -241,7 +243,33 @@ cmd_check() {
     r=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$M/")
     expect "metrics port: anything but /metrics is 404" [ "$r" = 404 ]
 
-    # 11. The binary refuses a non-loopback or self-pointing upstream and bad flags.
+    # 11. Adaptive mode, with the real monitor thread: free passes while calm,
+    #     the CAPTCHA once the force file exists (within one monitor tick, 5 s).
+    A=$CHECK_ADAPTIVE_PORT
+    AM=$CHECK_ADAPTIVE_METRICS_PORT
+    force="${TMPDIR:-/tmp}/onion-gate-harness-force.$$"
+    rm -f "$force"
+    spawn "$BIN/onion-gate" "$A" --proxy-protocol "--upstream=127.0.0.1:$CHECK_BACKEND_PORT" \
+        --captcha=adaptive "--adaptive-force-file=$force" "--metrics-port=$AM"
+    wait_port "$A"
+    r=$(gate "$A" 30 -i)
+    expect "adaptive, calm: a new visitor gets a free pass (303)" status_is "$r" 303
+    cookie=$(printf '%s' "$r" | sed -n 's/^Set-Cookie: onion_gate_pass=\([0-9a-f]*\);.*/\1/p' | tr -d '\r')
+    r=$(gate "$A" 30 -H "Cookie: onion_gate_pass=$cookie")
+    expect "adaptive, calm: the free pass reaches the backend" has "$r" "the gate let you through"
+    touch "$force"
+    i=0
+    until gate "$A" 31 | grep -qF "$CHALLENGE" || [ "$i" -ge 24 ]; do
+        sleep 0.5
+        i=$((i + 1))
+    done
+    expect "adaptive, force file: new visitors get the CAPTCHA" has "$(gate "$A" 32)" "$CHALLENGE"
+    expect "adaptive, force file: the free pass was revoked" has "$(gate "$A" 30 -H "Cookie: onion_gate_pass=$cookie")" "$CHALLENGE"
+    page=$(curl -sS --max-time 10 "http://127.0.0.1:$AM/metrics")
+    expect "adaptive: metrics show the mode (1 = under attack)" [ "$(metric onion_gate_mode)" = 1 ]
+    rm -f "$force"
+
+    # 12. The binary refuses a non-loopback or self-pointing upstream and bad flags.
     set +e
     "$BIN/onion-gate" 18090 --upstream=10.0.0.1:80 >/dev/null 2>&1
     expect "non-loopback upstream refused" [ $? -ne 0 ]

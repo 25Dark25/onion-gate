@@ -41,6 +41,12 @@ pub const GATE_PREFIX: &str = "/__gate/";
 /// Where the challenge form posts (inside GATE_PREFIX).
 pub const VERIFY_PATH: &str = "/__gate/verify";
 
+/// Largest body read from a request that cannot be forwarded (no live pass, or
+/// the gate's own namespace). The verify form is under 100 bytes. Anything
+/// larger is not read at all, so a visitor without a pass cannot make the gate
+/// buffer `max_body` bytes per connection.
+const GATE_MAX_BODY: usize = 1024;
+
 const MSG_FAIL: &str = "Wrong or expired. Try this new image.";
 const MSG_NEXT: &str = "Correct. One more.";
 const MSG_BUSY: &str = "Service busy. Try again in a few seconds.";
@@ -146,7 +152,16 @@ pub fn serve_connection(stream: &mut TcpStream, app: &App) {
         None => None,
     };
 
-    match http::read_request(stream, initial, app.max_body) {
+    let req = http::read_head(stream, initial).and_then(|p| {
+        if may_forward(&p.req, app) {
+            p.read_body(stream, app.max_body)
+        } else if p.content_length.unwrap_or(0) <= GATE_MAX_BODY {
+            p.read_body(stream, GATE_MAX_BODY)
+        } else {
+            Ok(p.skip_body())
+        }
+    });
+    match req {
         Ok(req) => match route(&req, circuit, app) {
             Out::Reply(r) => http::send(stream, &r),
             Out::Raw(bytes) => http::send_raw(stream, &bytes),
@@ -169,10 +184,25 @@ fn error_reply(e: &HttpError) -> Option<Reply> {
     Some(r)
 }
 
+fn in_gate_namespace(path: &str) -> bool {
+    path == GATE_PREFIX.trim_end_matches('/') || path.starts_with(GATE_PREFIX)
+}
+
+/// The pass cookie of a request, if it is well-formed.
+fn presented_pass(req: &Request) -> Option<Option<Token>> {
+    let v = req.cookie.as_deref().and_then(|c| http::cookie_get(c, COOKIE))?;
+    Some(store::from_hex(v))
+}
+
+/// Could this request reach the backend? Only then is its whole body worth
+/// reading. Checked again (and charged) when it is routed.
+fn may_forward(req: &Request, app: &App) -> bool {
+    !in_gate_namespace(&req.path) && matches!(presented_pass(req), Some(Some(t)) if app.store.pass_alive(&t))
+}
+
 /// Routes one parsed request.
 pub fn route(req: &Request, circuit: Option<u32>, app: &App) -> Out {
-    let path = req.path.as_str();
-    if path == GATE_PREFIX.trim_end_matches('/') || path.starts_with(GATE_PREFIX) {
+    if in_gate_namespace(&req.path) {
         Out::Reply(gate_route(req, circuit, app))
     } else {
         gated(req, circuit, app)
@@ -213,13 +243,10 @@ fn gated(req: &Request, circuit: Option<u32>, app: &App) -> Out {
         "/".to_string()
     };
 
-    let presented = req.cookie.as_deref().and_then(|c| http::cookie_get(c, COOKIE));
-    let pass = match presented {
+    let pass = match presented_pass(req) {
         None => return Out::Reply(gate(app, circuit, "", ret, false)),
-        Some(v) => match store::from_hex(v) {
-            Some(t) => t,
-            None => return Out::Reply(gate(app, circuit, "", ret, true)),
-        },
+        Some(None) => return Out::Reply(gate(app, circuit, "", ret, true)),
+        Some(Some(t)) => t,
     };
     match app.store.use_pass(&pass) {
         PassUse::Ok => {}

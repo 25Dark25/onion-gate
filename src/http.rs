@@ -204,9 +204,60 @@ pub fn parse_proxy(line: &str) -> Option<u32> {
     }
 }
 
+/// A request whose head has been read and validated, and whose body (if any)
+/// has not been read yet. The caller decides how much body it is willing to
+/// buffer once it knows who is asking (see `lib.rs`).
+pub struct PendingBody {
+    /// The request, with an empty `body`.
+    pub req: Request,
+    /// The declared body length, if any.
+    pub content_length: Option<usize>,
+    /// Body bytes already read together with the head.
+    rest: Vec<u8>,
+}
+
+impl PendingBody {
+    /// Reads the body. More than `max_body` declared => TooLarge, nothing read.
+    pub fn read_body(self, stream: &mut TcpStream, max_body: usize) -> Result<Request, HttpError> {
+        let PendingBody { mut req, content_length, rest } = self;
+        let cl = match content_length {
+            Some(cl) => cl,
+            None => return Ok(req),
+        };
+        if cl > max_body {
+            return Err(HttpError::TooLarge);
+        }
+        let mut body = rest;
+        let mut chunk = [0u8; 1024];
+        let body_deadline = Instant::now() + BODY_DEADLINE;
+        while body.len() < cl {
+            let n = read_some(stream, &mut chunk, body_deadline)?;
+            if n == 0 {
+                return Err(HttpError::Closed);
+            }
+            body.extend_from_slice(&chunk[..n]);
+        }
+        body.truncate(cl); // anything extra (pipelining) is discarded
+        req.body = body;
+        Ok(req)
+    }
+
+    /// Gives up on the body: the request is handled as if it had none, and the
+    /// unread bytes are left on the socket (the connection is closed after the
+    /// reply anyway).
+    pub fn skip_body(self) -> Request {
+        self.req
+    }
+}
+
 /// Reads one HTTP request. `initial` holds bytes already read (whatever followed
 /// the PROXY line, or nothing). `max_body` caps the request body.
 pub fn read_request(stream: &mut TcpStream, initial: Vec<u8>, max_body: usize) -> Result<Request, HttpError> {
+    read_head(stream, initial)?.read_body(stream, max_body)
+}
+
+/// Reads and validates the request line and headers, but not the body.
+pub fn read_head(stream: &mut TcpStream, initial: Vec<u8>) -> Result<PendingBody, HttpError> {
     let deadline = Instant::now() + READ_DEADLINE;
     let mut buf: Vec<u8> = initial;
     buf.reserve(1024);
@@ -306,39 +357,25 @@ pub fn read_request(stream: &mut TcpStream, initial: Vec<u8>, max_body: usize) -
         return Err(HttpError::Bad);
     }
 
-    // 4) body (only when a Content-Length is given; GET/HEAD usually have none)
-    let mut body: Vec<u8> = Vec::new();
-    match content_length {
-        Some(cl) => {
-            if cl > max_body {
-                return Err(HttpError::TooLarge);
-            }
-            body.extend_from_slice(&buf[head_end + 4..]);
-            let body_deadline = Instant::now() + BODY_DEADLINE;
-            while body.len() < cl {
-                let n = read_some(stream, &mut chunk, body_deadline)?;
-                if n == 0 {
-                    return Err(HttpError::Closed);
-                }
-                body.extend_from_slice(&chunk[..n]);
-            }
-            body.truncate(cl); // anything extra (pipelining) is discarded
-        }
-        None => {
-            // No body. POST/PUT/PATCH without a length cannot be framed safely.
-            if matches!(m, "POST" | "PUT" | "PATCH") {
-                return Err(HttpError::LengthRequired);
-            }
-        }
+    // 4) the body is read later (PendingBody::read_body), once the caller knows
+    //    how much it will accept. POST/PUT/PATCH without a length cannot be
+    //    framed safely.
+    if content_length.is_none() && matches!(m, "POST" | "PUT" | "PATCH") {
+        return Err(HttpError::LengthRequired);
     }
 
-    Ok(Request {
-        method,
-        target: target.to_string(),
-        path,
-        headers,
-        cookie,
-        body,
+    let rest = buf[head_end + 4..].to_vec();
+    Ok(PendingBody {
+        req: Request {
+            method,
+            target: target.to_string(),
+            path,
+            headers,
+            cookie,
+            body: Vec::new(),
+        },
+        content_length,
+        rest,
     })
 }
 

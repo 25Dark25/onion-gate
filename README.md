@@ -236,7 +236,8 @@ Guarantees (as far as the code goes):
   throughout.
 - **Loopback only:** listens on `127.0.0.1`; the upstream must be loopback too.
 - **No visitor data added** to forwarded requests; the pass cookie is stripped.
-- **Bounded memory** in every store.
+- **Bounded memory** in every store, and no request body buffered (beyond
+  1 KiB) for a visitor without a valid pass.
 
 ## Limitations
 
@@ -260,6 +261,10 @@ Be honest with yourself about what this is:
 - **A sub-request without a pass gets the challenge page.** If a pass expires
   while a page is loading, an image or stylesheet request receives HTML instead
   and shows as broken until the next navigation, which shows the CAPTCHA.
+- **Without a valid pass, a request body over 1 KiB is never read** (so nobody
+  can make the gate buffer uploads before passing the CAPTCHA). If a pass
+  expires while the visitor is uploading a large form, the browser may show a
+  connection error instead of the challenge; reloading the page shows it.
 - **One backend, loopback only.** No load balancing, no TLS termination, no
   virtual hosts. Put those in your backend or in front of tor.
 - **Network-level DoS** is tor's job (its PoW and introduction defenses) plus the

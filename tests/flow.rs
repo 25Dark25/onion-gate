@@ -381,3 +381,28 @@ fn a_page_with_many_assets_does_not_revoke_the_pass() {
     }
 }
 
+
+#[test]
+fn a_passless_request_body_is_not_buffered() {
+    // Without a pass, a large body is never read: the challenge comes back at
+    // once instead of after the gate waited for (and held) the whole body.
+    let (port, _app) = start();
+    let t0 = std::time::Instant::now();
+    let out = send_raw(
+        port,
+        0x3535_3535,
+        "POST /upload HTTP/1.1\r\nHost: t.onion\r\nContent-Length: 60000\r\n\r\nonly a few bytes",
+    );
+    assert!(is_challenge(&out), "{}", &out[..out.len().min(120)]);
+    assert!(t0.elapsed() < Duration::from_secs(3), "took {:?}", t0.elapsed());
+}
+
+#[test]
+fn a_large_body_with_a_valid_pass_is_forwarded() {
+    let (port, app) = start();
+    let c = 0x3636_3636;
+    let pass = pass_for(port, app.as_ref(), c);
+    let body = "a".repeat(50_000);
+    let r = send(port, c, "POST", "/big", Some(&pass), Some(&body));
+    assert!(r.starts_with("HTTP/1.1 200") && r.contains(&body), "{}", &r[..r.len().min(120)]);
+}

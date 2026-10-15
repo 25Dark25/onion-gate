@@ -225,6 +225,12 @@ impl Store {
         PassUse::Ok
     }
 
+    /// Is the pass registered and alive? Charges nothing and renews nothing.
+    pub fn pass_alive(&self, token: &Token) -> bool {
+        let now = Instant::now();
+        self.lock().passes.get(token).is_some_and(|p| p.alive(now))
+    }
+
     /// Revokes a pass (e.g. its circuit went over the page limit).
     pub fn revoke_pass(&self, token: &Token) {
         self.lock().passes.remove(token);
@@ -445,7 +451,9 @@ mod tests {
         let s = Store::new();
         assert!(s.add_pass(T1));
         assert!(s.add_pass(T2));
+        assert!(s.pass_alive(&T1));
         s.revoke_pass(&T1);
+        assert!(!s.pass_alive(&T1));
         assert_eq!(s.use_pass(&T1), PassUse::Invalid);
         assert_eq!(s.use_pass(&T2), PassUse::Ok);
     }

@@ -186,6 +186,10 @@ sooner. The circuit budget must stay looser than the pass budget.
 | `upstream` | — (required) | The backend, `host:port`, on loopback |
 | `proxy_protocol` | no | Read tor's PROXY line: per-circuit limits. **Use `yes` behind tor** |
 | `metrics_port` | 0 (off) | Port on 127.0.0.1 for aggregate [metrics](#metrics) |
+| `captcha` | always | `always`, or `adaptive`: no CAPTCHA while calm, see [Adaptive mode](#adaptive-mode) |
+| `adaptive_new_per_minute` | 60 | Adaptive: arrivals per minute that mean an attack |
+| `adaptive_hold` | 15m | Adaptive: time without any signal before calming down |
+| `adaptive_force_file` | (none) | Adaptive: while this file exists, the CAPTCHA is on for everyone new |
 | `rounds` | 2 | CAPTCHA rounds in a row for a pass (1–5) |
 | `challenge_ttl` | 30s | How long a challenge image is valid (+5 s grace for Tor latency) |
 | `pass_idle` / `pass_max` | 30m / 2h | A pass expires when unused this long / this long after it was issued |
@@ -209,6 +213,49 @@ Fixed in the code on purpose (protocol hardening, not tuning):
 | Image difficulty | — | constants at the top of `src/captcha.rs` |
 | CAPTCHA page text and style | — | `src/html.rs` |
 
+## Adaptive mode
+
+With `captcha = adaptive` (it needs `proxy_protocol = yes`), visitors only see
+the CAPTCHA when the gate looks attacked:
+
+- **Calm:** a visitor without a pass gets a **free pass** — a `303` back to the
+  same URL with the pass cookie — and goes straight to the site. A free pass
+  has the same request budget, lifetime and memory share as a solved one, and
+  getting one costs a challenge permit of the circuit (10 in a burst, 10 a
+  minute), like an image would. A pass that spends its budget gets the
+  CAPTCHA, never a new free pass. Free passes may fill at most half the pass
+  store.
+- **Under attack:** every free pass is revoked at once, and everyone without a
+  solved pass gets the CAPTCHA, exactly as with `captcha = always`. Solved
+  passes are never revoked by a mode change.
+
+Every 5 seconds the gate looks at the last minute. It goes under attack when
+any of these holds: more than `adaptive_new_per_minute` arrivals (requests for
+the site without a valid pass); more than 30 rate-limit answers; more than 10
+backend failures; more than half of `max_conn` or of `memory` in use; or the
+`adaptive_force_file` exists. It calms down only after `adaptive_hold` with
+none of them, so an attacker cannot make it flap. Every change is printed to
+standard error (with its reason, never visitor data) and counted in the
+metrics.
+
+To force the CAPTCHA by hand, create the file; to let the gate decide again,
+delete it. The gate only checks that it exists, so any path it can read works,
+for example next to the configuration (it survives restarts there):
+
+```
+adaptive_force_file = /etc/onion-gate/under-attack
+```
+```bash
+sudo touch /etc/onion-gate/under-attack   # CAPTCHA for everyone new, within 5 s
+sudo rm /etc/onion-gate/under-attack      # back to automatic (calm after adaptive_hold)
+```
+
+**What it gives up, on purpose:** while calm, anyone reaches your site without
+a CAPTCHA, bots included, limited only by the per-pass and per-circuit
+budgets. Choose it when friction for real visitors matters more than keeping
+bots off between attacks; keep `captcha = always` when the CAPTCHA itself is
+the point (scrapers, spam, account creation).
+
 ## Metrics
 
 With `metrics_port` set, onion-gate serves aggregate counters at
@@ -223,6 +270,9 @@ curl -s http://127.0.0.1:9180/metrics | grep -v '^#'
 | Metric | What it counts |
 | --- | --- |
 | `onion_gate_challenges_total` | Challenge images generated |
+| `onion_gate_arrivals_total` | Requests for the site without a valid pass (new visitors, expired passes, bots) |
+| `onion_gate_free_passes_total` | Passes issued without a CAPTCHA (adaptive, calm) |
+| `onion_gate_mode`, `onion_gate_mode_changes_total` | 0 = adaptive and calm, 1 = adaptive and under attack, 2 = `captcha = always`; changes |
 | `onion_gate_verifications_total{result}` | CAPTCHA answers: `failed`, `next_round`, `passed` (= passes issued) |
 | `onion_gate_rate_limited_total{limit}` | 429s: `conn_per_circuit`, `challenge` |
 | `onion_gate_passes_revoked_total{budget}` | Passes revoked for spending the `pass` or the `circuit` budget |
@@ -298,6 +348,7 @@ src/lib.rs       the gate: routing, the challenge/verify flow, forwarding, retur
 src/main.rs      the binary: configuration, --check/--print-config, loopback bind, accept loop
 src/config.rs    settings: defaults, the file and flag parser, validation
 src/metrics.rs   aggregate counters and the loopback /metrics endpoint
+src/adaptive.rs  adaptive mode: the attack monitor, free passes while calm
 src/captcha.rs   challenge drawing, distortion, click validation
 src/store.rs     single-use challenge tokens, session passes and their budget
 src/limit.rs     per-Tor-circuit limits (connections, challenges, pages) and the token bucket
@@ -321,7 +372,9 @@ deploy/          example configuration, torrc and a hardened systemd unit
 Guarantees (as far as the code goes):
 
 - **Gate:** no backend content — and no hint of which paths exist — without a
-  valid pass.
+  valid pass. With `captcha = always` (the default) a pass means a solved
+  CAPTCHA; with `captcha = adaptive`, while calm, it does not (see
+  [Adaptive mode](#adaptive-mode)).
 - **Single-use tokens** with strict expiry; the same generic message for every
   failure, always with a new image (no oracle).
 - **No open redirect:** the post-CAPTCHA return path is sanitized to a

@@ -51,6 +51,9 @@ everything. CI runs it on Linux.
   another circuit is still served;
 - per circuit: 8 connections held open, the 9th gets `429`; it is served again
   once they close;
+- adaptive mode on a second gate, with its real monitor thread: a new visitor
+  gets a free pass that reaches the backend; once the force file exists, new
+  visitors get the CAPTCHA, the free pass is revoked, and the metrics say so;
 - the metrics (on port 18099) counted the challenges, failures, 429s and the
   missing PROXY line above, show no path, and serve nothing but `/metrics`;
 - the binary refuses a non-loopback upstream, an upstream on its own port, and

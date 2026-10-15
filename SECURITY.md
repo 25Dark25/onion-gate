@@ -6,7 +6,7 @@ Use **Security → Advisories → Report a vulnerability** on the repository pag
 
 ## In scope
 
-- Reaching the backend without a valid pass, or learning anything about it (which paths exist, its responses, its headers) before passing the CAPTCHA.
+- Reaching the backend without a valid pass, or learning anything about it (which paths exist, its responses, its headers) before passing the CAPTCHA. With `captcha = adaptive`, free passes while calm are by design; getting one while the gate is under attack, keeping one through the switch, or keeping the gate calm during an attack that the documented signals should catch, are in scope.
 - Reusing a challenge token, a click outside the target being accepted, or any response that reveals why an attempt failed (an oracle).
 - An open redirect through the return path after the CAPTCHA.
 - Request smuggling or header injection toward the backend, or response splitting toward the visitor.

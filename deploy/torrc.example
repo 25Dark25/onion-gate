@@ -12,6 +12,19 @@ HiddenServiceVersion 3
 HiddenServicePort 80 127.0.0.1:8088
 HiddenServiceExportCircuitID haproxy
 
+# Floods from many circuits are tor's job, not onion-gate's: turn tor's own
+# defenses on.
+#
+# Proof-of-work for clients when the service is under load (tor >= 0.4.8). It
+# needs a tor built with --enable-gpl: check that `tor --list-modules` prints
+# "pow: yes"; some distribution packages are built without it.
+HiddenServicePoWDefensesEnabled 1
+# At most 16 streams open at once on one rendezvous circuit, and close a
+# circuit that asks for more. onion-gate itself admits 8 connections per
+# circuit (MAX_CONN_PER_CIRCUIT), so this only cuts circuits that are abusive.
+HiddenServiceMaxStreams 16
+HiddenServiceMaxStreamsCloseCircuit 1
+
 # Optional hardening (recommended for a service that only serves a hidden
 # service and makes no outbound connections of its own):
 # SocksPort 0

@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Use **Security → Advisories → Report a vulnerability** on the repository page (GitHub private vulnerability reporting). Please do not open a public issue for security problems. Include the version or commit, the exact command line (`--upstream`, `--proxy-protocol`, …), steps to reproduce and the impact.
+Use **Security → Advisories → Report a vulnerability** on the repository page (GitHub private vulnerability reporting). Please do not open a public issue for security problems. Include the version or commit, the configuration (the output of `onion-gate --print-config` with your flags or `--config` file), steps to reproduce and the impact.
 
 ## In scope
 

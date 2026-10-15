@@ -1,21 +1,25 @@
 # Hardened systemd unit for onion-gate.
 #
-# Adjust the port, the --upstream address and the binary path to your setup,
-# then:
-#   sudo cp onion-gate /usr/local/bin/
+# Install (set upstream in the configuration to YOUR backend, which must
+# listen on loopback):
+#   sudo cp target/release/onion-gate /usr/local/bin/
+#   sudo mkdir -p /etc/onion-gate
+#   sudo cp deploy/onion-gate.conf /etc/onion-gate/onion-gate.conf
 #   sudo cp deploy/onion-gate.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now onion-gate
 #
-# This unit assumes tor is configured with HiddenServiceExportCircuitID haproxy
-# (see torrc.example), hence --proxy-protocol. Point --upstream at YOUR backend,
-# which must listen on loopback.
+# The example configuration sets proxy_protocol = yes, which needs tor's
+# HiddenServiceExportCircuitID haproxy (see torrc.example).
 
 [Unit]
 Description=onion-gate (CAPTCHA gate + reverse proxy)
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/onion-gate 8088 --proxy-protocol --upstream=127.0.0.1:3000
+# Refuse to start on a configuration error (a backend that is down is only a
+# warning: it may come up after the gate).
+ExecStartPre=/usr/local/bin/onion-gate --config=/etc/onion-gate/onion-gate.conf --check
+ExecStart=/usr/local/bin/onion-gate --config=/etc/onion-gate/onion-gate.conf
 DynamicUser=yes
 NoNewPrivileges=yes
 ProtectSystem=strict
@@ -33,9 +37,10 @@ SystemCallArchitectures=native
 # onion-gate listens on loopback and only connects to a loopback upstream.
 IPAddressAllow=localhost
 IPAddressDeny=any
-# One thread per connection: MAX_CONN (512) plus the main thread, with margin.
+# One thread per connection: max_conn (512) plus the main thread, with margin.
+# Raise it with max_conn.
 TasksMax=520
-# Worst case is roughly 300 MiB: 128 MiB of buffered bodies (MAX_BUFFERED, an
+# Worst case is roughly 300 MiB: 128 MiB of buffered bodies (the memory setting, an
 # approximate count: allocator slack is not included), about 120 MiB if all 512
 # connections draw a challenge image at once (~240 KiB each), and the bounded
 # stores.

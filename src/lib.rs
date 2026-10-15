@@ -18,6 +18,7 @@
 compile_error!("onion-gate needs a Unix-like system (Linux, macOS, BSD): it reads randomness from /dev/urandom");
 
 pub mod captcha;
+pub mod config;
 /// Fuzz targets (see fuzz.rs): built for tests, or with the `fuzzing` feature
 /// for an external fuzzer. Not part of the gate.
 #[cfg(any(test, feature = "fuzzing"))]
@@ -32,13 +33,15 @@ pub mod store;
 pub mod upstream;
 
 use http::{HttpError, Reply, Request};
+use config::Limits;
 use limit::{Limiter, Memory, Owner, Reservation};
 use rng::Rng;
 use std::net::TcpStream;
 use store::{PassUse, Store, Token};
 use upstream::Upstream;
 
-/// Consecutive CAPTCHA rounds required. A failure restarts the chain.
+/// Consecutive CAPTCHA rounds required by default (`rounds` in the
+/// configuration). A failure restarts the chain.
 pub const ROUNDS: u8 = 2;
 /// Name of the session pass cookie.
 pub const COOKIE: &str = "onion_gate_pass";
@@ -69,10 +72,25 @@ pub struct App {
     pub upstream: Upstream,
     /// true = every connection starts with tor's PROXY line (mandatory then).
     pub proxy: bool,
-    /// Largest request body accepted (and thus forwarded).
-    pub max_body: usize,
     /// Global budget for buffered request and response bytes.
     pub memory: Memory,
+    /// The configured limits (rounds, challenge lifetime, body cap, ...). The
+    /// store, limiter, memory budget and upstream above were built from them.
+    pub limits: Limits,
+}
+
+impl App {
+    /// The shared state for a configuration and an already-checked upstream.
+    pub fn new(upstream: Upstream, proxy: bool, limits: Limits) -> App {
+        App {
+            store: Store::with_limits(&limits),
+            limiter: Limiter::with_limits(&limits),
+            upstream: upstream.with_limits(limits.max_response, limits.upstream_timeout),
+            proxy,
+            memory: Memory::from_limits(&limits),
+            limits,
+        }
+    }
 }
 
 /// What `route` produces: either a page the gate generated, or already-framed
@@ -170,7 +188,7 @@ pub fn serve_connection(stream: &mut TcpStream, app: &App) {
         if let Some(pass) = may_forward(&p.req, app) {
             let owners = owners(circuit, &pass);
             let held = body_mem.insert(app.memory.reserve_for(&owners, 0).ok_or(HttpError::Busy)?);
-            p.read_body(stream, app.max_body, Some(held))
+            p.read_body(stream, app.limits.max_body, Some(held))
         } else if cl <= GATE_MAX_BODY {
             p.read_body(stream, GATE_MAX_BODY, None)
         } else {
@@ -248,13 +266,13 @@ fn gate_route(req: &Request, circuit: Option<u32>, app: &App) -> Reply {
             if !challenge_allowed(app, circuit) {
                 return too_many();
             }
-            new_challenge(&app.store, ROUNDS, "", "/".to_string())
+            new_challenge(app, app.limits.rounds, "", "/".to_string())
         }
         (_, true, VERIFY_PATH) => {
             if !challenge_allowed(app, circuit) {
                 return too_many();
             }
-            verify(req, &app.store)
+            verify(req, app)
         }
         (_, _, VERIFY_PATH) => method_not_allowed("POST"),
         (_, _, p) if p == GATE_PREFIX => method_not_allowed("GET"),
@@ -303,7 +321,7 @@ fn gated<'a>(req: &Request, circuit: Option<u32>, app: &'a App) -> Out<'a> {
 /// Serves a challenge in place (200). `clear` deletes a dead pass cookie.
 fn gate(app: &App, circuit: Option<u32>, notice: &str, ret: String, clear: bool) -> Reply {
     let mut r = if challenge_allowed(app, circuit) {
-        new_challenge(&app.store, ROUNDS, notice, ret)
+        new_challenge(app, app.limits.rounds, notice, ret)
     } else {
         too_many()
     };
@@ -314,25 +332,28 @@ fn gate(app: &App, circuit: Option<u32>, notice: &str, ret: String, clear: bool)
 }
 
 /// Generates a challenge, registers it and returns the page.
-fn new_challenge(store: &Store, rounds_left: u8, notice: &str, ret: String) -> Reply {
-    let rounds_left = rounds_left.clamp(1, ROUNDS);
+fn new_challenge(app: &App, rounds_left: u8, notice: &str, ret: String) -> Reply {
+    let rounds = app.limits.rounds;
+    let rounds_left = rounds_left.clamp(1, rounds);
     let mut rng = Rng::new();
     let ch = captcha::generate(&mut rng);
     let token = rng.token();
-    if !store.add_challenge(token, ch.secret, rounds_left, ret) {
+    if !app.store.add_challenge(token, ch.secret, rounds_left, ret) {
         return Reply::page(503, html::message(MSG_BUSY));
     }
     let page = html::challenge(
         &html::base64(&ch.png),
         &store::to_hex(&token),
-        ROUNDS - rounds_left + 1,
-        ROUNDS,
+        rounds - rounds_left + 1,
+        rounds,
         notice,
+        app.limits.challenge_ttl,
     );
     Reply::page(200, page)
 }
 
-fn verify(req: &Request, store: &Store) -> Reply {
+fn verify(req: &Request, app: &App) -> Reply {
+    let store = &app.store;
     let body = std::str::from_utf8(&req.body).unwrap_or("");
 
     // 1) The token is CONSUMED before anything else: one attempt per token.
@@ -341,7 +362,7 @@ fn verify(req: &Request, store: &Store) -> Reply {
         .and_then(|t| store.take_challenge(&t));
     let pending = match pending {
         Some(p) => p,
-        None => return new_challenge(store, ROUNDS, MSG_FAIL, "/".to_string()),
+        None => return new_challenge(app, app.limits.rounds, MSG_FAIL, "/".to_string()),
     };
 
     // 2) Strict coordinates; anything odd = generic failure.
@@ -355,10 +376,10 @@ fn verify(req: &Request, store: &Store) -> Reply {
     // 3) Same message for every failure: the reason is never revealed. A
     //    failure restarts from round 1 with a new image, keeping the return path.
     if !ok {
-        return new_challenge(store, ROUNDS, MSG_FAIL, pending.ret);
+        return new_challenge(app, app.limits.rounds, MSG_FAIL, pending.ret);
     }
     if pending.rounds_left > 1 {
-        return new_challenge(store, pending.rounds_left - 1, MSG_NEXT, pending.ret);
+        return new_challenge(app, pending.rounds_left - 1, MSG_NEXT, pending.ret);
     }
 
     // 4) Passed: issue a session pass and 303 (POST -> GET) to the stored path.

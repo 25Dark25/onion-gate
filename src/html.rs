@@ -9,7 +9,7 @@
 //! the page: it lives server-side, bound to the challenge token (store.rs).
 
 use crate::captcha::{H, W};
-use crate::store::CHALLENGE_TTL;
+use std::time::Duration;
 
 const HEAD: &str = r#"<!doctype html>
 <html lang="en">
@@ -37,7 +37,8 @@ a{color:#8cc2a8}
 const TAIL: &str = "</main>\n</body>\n</html>\n";
 
 /// Challenge page. `notice` is STATIC text (may be "").
-pub fn challenge(png_b64: &str, token_hex: &str, round: u8, rounds: u8, notice: &str) -> String {
+/// `ttl` is how long the challenge is valid: the time bar empties over it.
+pub fn challenge(png_b64: &str, token_hex: &str, round: u8, rounds: u8, notice: &str, ttl: Duration) -> String {
     let mut s = String::with_capacity(png_b64.len() + 1536);
     s.push_str(HEAD);
     s.push_str("<p><b>Click the broken circle.</b> (");
@@ -50,9 +51,9 @@ pub fn challenge(png_b64: &str, token_hex: &str, round: u8, rounds: u8, notice: 
         s.push_str(notice);
         s.push_str("</p>\n");
     }
-    // Time-left bar: CSS only (no JS), empties over CHALLENGE_TTL.
+    // Time-left bar: CSS only (no JS), empties over the challenge's lifetime.
     s.push_str("<div class=\"b\"><i style=\"animation:d ");
-    s.push_str(&CHALLENGE_TTL.as_secs().to_string());
+    s.push_str(&ttl.as_secs().to_string());
     s.push_str("s linear forwards\"></i></div>\n");
     // <input type="image"> submits c.x and c.y (click coordinates in CSS px,
     // relative to the image's top-left corner). No border or padding and a
@@ -131,7 +132,7 @@ mod tests {
 
     #[test]
     fn challenge_page_has_what_it_needs_and_nothing_external() {
-        let p = challenge("QUJD", "00112233445566778899aabbccddeeff", 1, 2, "");
+        let p = challenge("QUJD", "00112233445566778899aabbccddeeff", 1, 2, "", Duration::from_secs(30));
         assert!(p.contains("<html lang=\"en\">"));
         assert!(p.contains("name=\"t\" value=\"00112233445566778899aabbccddeeff\""));
         assert!(p.contains("type=\"image\" name=\"c\""));
@@ -150,7 +151,7 @@ mod tests {
 
     #[test]
     fn notice_only_appears_when_given() {
-        assert!(!challenge("A", "t", 1, 1, "").contains("class=\"m\""));
-        assert!(challenge("A", "t", 1, 1, "Wrong").contains("<p class=\"m\">Wrong</p>"));
+        assert!(!challenge("A", "t", 1, 1, "", Duration::from_secs(30)).contains("class=\"m\""));
+        assert!(challenge("A", "t", 1, 1, "Wrong", Duration::from_secs(30)).contains("<p class=\"m\">Wrong</p>"));
     }
 }

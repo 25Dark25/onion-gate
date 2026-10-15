@@ -2,7 +2,7 @@
 #
 # The key line is HiddenServiceExportCircuitID haproxy: it makes tor prepend a
 # PROXY v1 line to every connection, carrying a per-circuit identifier.
-# onion-gate reads it (with --proxy-protocol) to apply its per-circuit limits.
+# onion-gate reads it (with proxy_protocol = yes) to apply its per-circuit limits.
 # Without this line, onion-gate still works but can only apply the per-pass
 # limit (every visitor looks like the same circuit).
 
@@ -21,7 +21,7 @@ HiddenServiceExportCircuitID haproxy
 HiddenServicePoWDefensesEnabled 1
 # At most 16 streams open at once on one rendezvous circuit, and close a
 # circuit that asks for more. onion-gate itself admits 8 connections per
-# circuit (MAX_CONN_PER_CIRCUIT), so this only cuts circuits that are abusive.
+# circuit (conn_per_circuit), so this only cuts circuits that are abusive.
 HiddenServiceMaxStreams 16
 HiddenServiceMaxStreamsCloseCircuit 1
 

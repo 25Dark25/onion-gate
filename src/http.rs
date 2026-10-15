@@ -22,14 +22,14 @@ use crate::limit::Reservation;
 use std::time::{Duration, Instant};
 
 const MAX_HEAD: usize = 16 * 1024;
-/// Default body cap. The binary overrides it from `--max-body`.
+/// Default body cap (the `max_body` setting).
 pub const DEFAULT_MAX_BODY: usize = 1024 * 1024;
 const MAX_TARGET: usize = 2048;
 /// Deadline for the request line and headers (anti-slowloris).
 const READ_DEADLINE: Duration = Duration::from_secs(8);
 /// Extra time to receive a body once the head is in: a 1 MiB upload over Tor
 /// can take tens of seconds. Slow senders still hold at most
-/// `MAX_CONN_PER_CIRCUIT` connections per circuit.
+/// `conn_per_circuit` connections per circuit.
 const BODY_DEADLINE: Duration = Duration::from_secs(60);
 /// Tor writes the PROXY line as soon as it opens the connection: no need to wait.
 const PROXY_DEADLINE: Duration = Duration::from_secs(2);

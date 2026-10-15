@@ -98,37 +98,115 @@ deliberate: the whole point is that the visitor stays anonymous.
 - For per-circuit limits: tor with `HiddenServiceExportCircuitID haproxy`
   (see [`deploy/torrc.example`](deploy/torrc.example)). Without it the gate still
   works, but can only apply the per-pass limit: challenge generation (CPU) is
-  then unlimited, so run without `--proxy-protocol` for local tests only (the
+  then unlimited, so run without `proxy_protocol` for local tests only (the
   binary warns at startup).
 
-## Build and run
+## Quick start
+
+From a source checkout (or a verified release, see below) to a protected
+`.onion`, assuming your site already runs on the same machine:
+
+1. **Build** (no crates to download):
+
+   ```bash
+   cargo build --release --offline
+   sudo cp target/release/onion-gate /usr/local/bin/
+   ```
+
+2. **Keep your backend on loopback.** Make nginx, Caddy or your app listen on
+   `127.0.0.1:3000` (any loopback port), not on a public address.
+
+3. **Configure onion-gate.** Copy the example and set `upstream` to that
+   address; every other setting has a working default:
+
+   ```bash
+   sudo mkdir -p /etc/onion-gate
+   sudo cp deploy/onion-gate.conf /etc/onion-gate/onion-gate.conf
+   sudoedit /etc/onion-gate/onion-gate.conf          # upstream = 127.0.0.1:3000
+   onion-gate --config=/etc/onion-gate/onion-gate.conf --check
+   ```
+
+4. **Point tor at onion-gate**, not at the backend, and let it send the circuit
+   identifier (full example with tor's own defenses:
+   [`deploy/torrc.example`](deploy/torrc.example)):
+
+   ```
+   HiddenServicePort 80 127.0.0.1:8088
+   HiddenServiceExportCircuitID haproxy
+   HiddenServicePoWDefensesEnabled 1
+   ```
+
+5. **Run it** with the hardened systemd unit, and reload tor:
+
+   ```bash
+   sudo cp deploy/onion-gate.service /etc/systemd/system/
+   sudo systemctl daemon-reload && sudo systemctl enable --now onion-gate
+   sudo systemctl reload tor
+   ```
+
+Open the `.onion` in Tor Browser: you get the CAPTCHA first, and your site
+after. To try it locally first, without tor or a backend of your own,
+`scripts/harness.sh up` starts a test backend and the gate (see
+[docs/TESTING.md](docs/TESTING.md)).
+
+Your backend needs no changes, with two rules: **do not use the `/__gate/`
+path prefix** (the gate's own), and expect one request per connection (no
+keep-alive). It will see no visitor address and no `X-Forwarded-*` headers; see
+[What the backend sees](#what-the-backend-sees).
+
+## Configuration
+
+Every setting can go in the file (`key = value`) or on the command line
+(`--key=value`, which overrides the file); `-` and `_` are interchangeable. Only
+`upstream` is required.
 
 ```bash
-cargo build --release --offline      # produces target/release/onion-gate
-cargo test  --offline                 # run the test suite
+onion-gate --help                          # every setting, its default and what it does
+onion-gate --print-config [...]            # the effective configuration, as a ready-to-edit file
+onion-gate --config=FILE --check           # validate (and see if the backend answers), then exit
+onion-gate --upstream=127.0.0.1:3000 --proxy-protocol    # no file needed
 ```
 
-Run it in front of a backend on `127.0.0.1:3000`:
+Values are human-readable: durations `45s`, `30m`, `2h`; sizes `512K`, `8M`;
+rates in requests per minute. A configuration that breaks a rule (a circuit
+budget tighter than a pass budget, a response cap that no memory share can
+hold, ...) is refused at start with every problem listed. The listen address
+is not a setting: onion-gate only ever listens on `127.0.0.1`.
 
-```bash
-# local testing (plain HTTP, no PROXY line, no per-circuit limits):
-./target/release/onion-gate 8088 --upstream=127.0.0.1:3000
+**Every request counts against the budgets, assets included.** With no
+keep-alive, a page with 20 images, stylesheets and scripts is 21 requests and 21
+connections. The defaults fit roughly three such pages a minute per visitor
+with room for bursts. A heavier site needs larger budgets; a site that inlines
+its assets can use much tighter ones (one request per page) and catch scrapers
+sooner. The circuit budget must stay looser than the pass budget.
 
-# production behind tor (tor sends the PROXY line):
-./target/release/onion-gate 8088 --proxy-protocol --upstream=127.0.0.1:3000
-```
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `port` | 8088 | Port on 127.0.0.1 |
+| `upstream` | — (required) | The backend, `host:port`, on loopback |
+| `proxy_protocol` | no | Read tor's PROXY line: per-circuit limits. **Use `yes` behind tor** |
+| `rounds` | 2 | CAPTCHA rounds in a row for a pass (1–5) |
+| `challenge_ttl` | 30s | How long a challenge image is valid (+5 s grace for Tor latency) |
+| `pass_idle` / `pass_max` | 30m / 2h | A pass expires when unused this long / this long after it was issued |
+| `pass_burst` / `pass_per_minute` | 60 / 60 | Requests per pass; spending them revokes the pass |
+| `circuit_burst` / `circuit_per_minute` | 90 / 90 | Forwarded requests per Tor circuit |
+| `challenge_burst` / `challenge_per_minute` | 10 / 10 | Challenge images per circuit (each costs CPU) |
+| `conn_per_circuit` / `max_conn` | 8 / 512 | Simultaneous connections per circuit / in total |
+| `max_body` / `max_response` | 1M / 8M | Largest request body forwarded / backend response relayed |
+| `upstream_timeout` | 30s | How long the backend may take to answer |
+| `memory` / `memory_per_circuit` / `memory_per_pass` | 128M / 24M / 32M | Bytes buffered at once: total, and the most one circuit / one pass may hold |
 
-Flags:
+Fixed in the code on purpose (protocol hardening, not tuning):
 
-| Flag | Meaning |
-| --- | --- |
-| `[port]` | Port to listen on (loopback only). Default `8088`. |
-| `--upstream=HOST:PORT` | **Required.** The backend to protect. Must resolve to loopback, and not to onion-gate's own port. |
-| `--proxy-protocol` | Require tor's PROXY v1 line on every connection (production). |
-| `--max-body=BYTES` | Cap on request body size (default 1 MiB). |
-
-Then open the `.onion` (or `http://127.0.0.1:8088` for a local test) in Tor
-Browser: you get the CAPTCHA first, and your site after.
+| What | Value | Where |
+| --- | --- | --- |
+| Pass cookie name / gate path prefix | `onion_gate_pass` / `/__gate/` | `COOKIE`, `GATE_PREFIX` in `src/lib.rs` |
+| Request head / target cap | 16 KiB / 2 KiB | `MAX_HEAD`, `MAX_TARGET` in `src/http.rs` |
+| Read deadlines (head / body) | 8 s / 60 s | `READ_DEADLINE`, `BODY_DEADLINE` in `src/http.rs` |
+| Backend connect timeout | 5 s | `CONNECT_TIMEOUT` in `src/upstream.rs` |
+| Time to deliver one response | 30 s + size at 16 KiB/s, at most 300 s | `SEND_GRACE`, `MIN_SEND_RATE`, `SEND_DEADLINE` in `src/http.rs` |
+| Image difficulty | — | constants at the top of `src/captcha.rs` |
+| CAPTCHA page text and style | — | `src/html.rs` |
 
 ## Download and verify a release
 
@@ -155,63 +233,28 @@ To check the hash: `sha256sum onion-gate-0.1.0.zip` (Linux), `shasum -a 256 onio
 
 ## Putting it in front of any server
 
-onion-gate speaks plain HTTP/1.1 to one loopback backend. Point `--upstream` at
+onion-gate speaks plain HTTP/1.1 to one loopback backend. Point `upstream` at
 whatever already serves your site:
 
-- **nginx / Caddy / Apache** — have them listen on, say, `127.0.0.1:3000` and run
-  `onion-gate 8088 --proxy-protocol --upstream=127.0.0.1:3000`. Point tor's
-  `HiddenServicePort` at `127.0.0.1:8088` instead of at the web server.
+- **nginx / Caddy / Apache** — have them listen on, say, `127.0.0.1:3000`, set
+  `upstream = 127.0.0.1:3000`, and point tor's `HiddenServicePort` at
+  onion-gate (`127.0.0.1:8088`) instead of at the web server.
 - **An app server** (Gunicorn, Node, a Go/Rust binary, …) — same idea: bind the
-  app to loopback and give its address to `--upstream`.
+  app to loopback and give its address to `upstream`.
 - **Static files** — serve them with any tiny static server on loopback and put
   onion-gate in front.
 
-The only change to your existing stack is that tor (or whatever faces the world)
-now talks to onion-gate, and onion-gate talks to your old entry point. Your
-backend does not need to know onion-gate exists, with one rule: **do not use the
-`/__gate/` path prefix**, and expect no keep-alive (one request per connection).
-
-A minimal hardened systemd unit is in
-[`deploy/onion-gate.service`](deploy/onion-gate.service).
-
-## Tunable constants (and where)
-
-All limits are plain constants — change them and rebuild. No config file.
-
-**Every request counts against the budgets, assets included.** With no
-keep-alive, a page with 20 images, stylesheets and scripts is 21 requests and 21
-connections. The defaults fit roughly three such pages a minute per visitor
-with room for bursts. A heavier site needs larger budgets; a site that inlines
-its assets can use much tighter ones (one request per page) and catch scrapers
-sooner. Keep the circuit budget looser than the pass budget — the build checks
-it.
-
-| What | Default | Where |
-| --- | --- | --- |
-| CAPTCHA rounds | 2 | `ROUNDS` in `src/lib.rs` |
-| Pass cookie name | `onion_gate_pass` | `COOKIE` in `src/lib.rs` |
-| Gate path prefix | `/__gate/` | `GATE_PREFIX`, `VERIFY_PATH` in `src/lib.rs` |
-| Challenge expiry / grace | 30 s / 5 s | `CHALLENGE_TTL`, `GRACE` in `src/store.rs` |
-| Pass idle / hard lifetime | 30 min / 2 h | `PASS_IDLE`, `PASS_MAX` in `src/store.rs` |
-| Pass request budget | 60 burst, 1 / s | `PASS_BURST`, `PASS_REFILL_PER_SEC` in `src/store.rs` |
-| Circuit request budget | 90 burst, 1.5 / s | `CIRCUIT_PAGE_BURST`, `CIRCUIT_PAGE_REFILL_PER_SEC` in `src/limit.rs` |
-| Challenge permits / circuit | 10 burst, 1 / 6 s | `CHALLENGE_BURST`, `CHALLENGE_REFILL_PER_SEC` in `src/limit.rs` |
-| Connections / circuit | 8 | `MAX_CONN_PER_CIRCUIT` in `src/limit.rs` |
-| Total connections | 512 | `MAX_CONN` in `src/main.rs` |
-| Request body cap | 1 MiB | `--max-body`, default `DEFAULT_MAX_BODY` in `src/http.rs` |
-| Request head / target cap | 16 KiB / 2 KiB | `MAX_HEAD`, `MAX_TARGET` in `src/http.rs` |
-| Read deadlines (head / body) | 8 s / 60 s | `READ_DEADLINE`, `BODY_DEADLINE` in `src/http.rs` |
-| Upstream response cap / timeouts | 8 MiB / 5 s connect, 30 s I/O | top of `src/upstream.rs` |
-| Buffered bytes: all / per circuit / per pass | 128 / 24 / 32 MiB | `MAX_BUFFERED`, `MAX_BUFFERED_PER_CIRCUIT`, `MAX_BUFFERED_PER_PASS` in `src/limit.rs` |
-| Time to deliver one response | 30 s + size at 16 KiB/s, at most 300 s | `SEND_GRACE`, `MIN_SEND_RATE`, `SEND_DEADLINE` in `src/http.rs` |
-| Image difficulty | — | constants at the top of `src/captcha.rs` |
-| CAPTCHA page text and style | — | `src/html.rs` |
+The only change to your existing stack is that tor now talks to onion-gate, and
+onion-gate talks to your old entry point. Remember that the backend sees no
+visitor address: anything it did per IP (rate limits, logs) now sees
+`127.0.0.1` for everyone, which is the point.
 
 ## Project layout
 
 ```
 src/lib.rs       the gate: routing, the challenge/verify flow, forwarding, return-path safety
-src/main.rs      the binary: flags, loopback bind, accept loop
+src/main.rs      the binary: configuration, --check/--print-config, loopback bind, accept loop
+src/config.rs    settings: defaults, the file and flag parser, validation
 src/captcha.rs   challenge drawing, distortion, click validation
 src/store.rs     single-use challenge tokens, session passes and their budget
 src/limit.rs     per-Tor-circuit limits (connections, challenges, pages) and the token bucket
@@ -226,7 +269,7 @@ examples/        local test harness: a test backend and a stand-in for tor's PRO
 scripts/         harness.sh: automated checks against the real binaries, and a stack for a browser
 docs/TESTING.md  how to test: cargo test, the harness, and the Tor Browser (Safest) checklist
 docs/CAPTCHA-STRENGTH.md  the CAPTCHA measured against a reference solver
-deploy/          example torrc and a hardened systemd unit
+deploy/          example configuration, torrc and a hardened systemd unit
 .github/         CI (tests on Linux and macOS, MSRV and stable) and Dependabot
 ```
 
@@ -268,23 +311,23 @@ Be honest with yourself about what this is:
 - **Passes are transferable.** A pass is a bearer cookie, not bound to a circuit;
   its budget and lifetime limit how much a shared pass is worth, no more.
 - **Whole request/response buffered in memory**, each capped, and all of them
-  together capped by a global budget (`MAX_BUFFERED`, 128 MiB): past it,
+  together capped by a global budget (`memory`, 128 MiB by default): past it,
   forwarded requests get `503` until memory is freed, instead of the process
   running out of memory. No streaming, no WebSockets (`101 Switching
   Protocols` is refused), no HTTP/2, no large uploads/downloads beyond the
-  caps. Raise `--max-body`, the response cap and the budget if you need more,
-  at a memory cost.
+  caps. Raise `max_body`, `max_response` and the `memory` settings if you need
+  more, at a memory cost.
 - **Slow readers hold their response, within limits.** A visitor with a valid
   pass who reads very slowly keeps its buffered response until it is delivered
   or its deadline passes: 30 s plus the time to send it at 16 KiB/s, at most
-  300 s. One circuit can hold at most 24 MiB of the budget this way and one
-  pass at most 32 MiB, so filling the whole 128 MiB takes at least 6 circuits
-  and 4 passes (8 solved CAPTCHAs); while it lasts, other forwarded requests
+  300 s. With the defaults, one circuit can hold at most 24 MiB of the budget
+  this way and one pass at most 32 MiB, so filling the whole 128 MiB takes at
+  least 6 circuits and 4 passes (8 solved CAPTCHAs); while it lasts, other forwarded requests
   get `503`. The responses are buffered rather than streamed on purpose:
   streaming would hand the slow reader to your backend instead, tying up its
   workers (the classic slow-client problem a buffering proxy exists to absorb).
-  A site that serves large files to untrusted visitors should lower the
-  response cap or serve them elsewhere.
+  A site that serves large files to untrusted visitors should lower
+  `max_response` or serve them elsewhere.
 - **Strict about the backend too.** A response with a `Transfer-Encoding` other
   than plain `chunked`, conflicting `Content-Length`s, a header name that is not
   a token, or control bytes or non-UTF-8 bytes in the status line or a header is

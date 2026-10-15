@@ -189,7 +189,8 @@ fn parse_head(raw: &[u8], head_only: bool) -> Result<Option<Head<'_>>, ProxyErro
             if lname == "transfer-encoding" {
                 // Only plain chunked is understood; anything else cannot be
                 // re-framed correctly, so refuse it rather than corrupt the body.
-                if !value.eq_ignore_ascii_case("chunked") {
+                // Chunked twice (or in two headers) is invalid too.
+                if !value.eq_ignore_ascii_case("chunked") || chunked {
                     return Err(ProxyError::BadResponse);
                 }
                 chunked = true;
@@ -241,6 +242,9 @@ fn read_response(stream: &mut TcpStream, head_only: bool) -> Result<Vec<u8>, Pro
     let mut chunk = [0u8; 8192];
     // (where the body starts in `buf`, how it is delimited), once the head is in
     let mut framing: Option<(usize, Body)> = None;
+    // Chunked bodies: offset (within the body) of the next chunk not yet seen
+    // whole, so each read resumes the walk instead of starting over.
+    let mut chunk_pos = 0usize;
     loop {
         let left = match deadline.checked_duration_since(Instant::now()) {
             Some(d) if !d.is_zero() => d,
@@ -271,8 +275,13 @@ fn read_response(stream: &mut TcpStream, head_only: bool) -> Result<Vec<u8>, Pro
         let done = match framing {
             Some((_, Body::None)) => true,
             Some((start, Body::Length(cl))) => buf.len() - start >= cl,
-            // The usual last chunk with no trailers; anything else ends at EOF.
-            Some((start, Body::Chunked)) => buf.len() - start >= 5 && buf.ends_with(b"0\r\n\r\n"),
+            // Walk the chunk structure: chunk data that merely ends in
+            // "0\r\n\r\n" must not be taken for the last chunk. Malformed
+            // framing stops reading; frame_response reports it.
+            Some((start, Body::Chunked)) => match walk_chunks(&buf[start..], &mut chunk_pos, |_| {}) {
+                Walk::More => false,
+                Walk::Done | Walk::Bad => true,
+            },
             Some((_, Body::ToEof)) | None => false,
         };
         if done {
@@ -345,16 +354,24 @@ fn build_request(req: &Request, pass_cookie: &str) -> Vec<u8> {
 /// upstream's Content-Length and sends no body.
 fn frame_response(raw: &[u8], head_only: bool) -> Result<Vec<u8>, ProxyError> {
     let h = parse_head(raw, head_only)?.ok_or(ProxyError::BadResponse)?;
-    let body: Vec<u8> = match h.body_kind {
-        Body::None => Vec::new(),
-        Body::Chunked => dechunk(h.body)?,
+    // The body's length, found without copying it (the copy is made once,
+    // straight into the output).
+    let body_len = match h.body_kind {
+        Body::None => 0,
+        Body::Chunked => {
+            let mut len = 0usize;
+            match walk_chunks(h.body, &mut 0, |c| len += c.len()) {
+                Walk::Done => len,
+                Walk::More | Walk::Bad => return Err(ProxyError::BadResponse), // truncated or malformed
+            }
+        }
         Body::Length(cl) => {
             if cl > h.body.len() {
                 return Err(ProxyError::BadResponse); // promised more than it sent
             }
-            h.body[..cl].to_vec()
+            cl
         }
-        Body::ToEof => h.body.to_vec(),
+        Body::ToEof => h.body.len(),
     };
 
     let reason = if h.reason.is_empty() { http::reason(h.code) } else { h.reason };
@@ -373,12 +390,19 @@ fn frame_response(raw: &[u8], head_only: bool) -> Result<Vec<u8>, ProxyError> {
             }
         }
         Body::None => {} // 204 / 304: no body and no length
-        _ => out.push_str(&format!("Content-Length: {}\r\n", body.len())),
+        _ => out.push_str(&format!("Content-Length: {}\r\n", body_len)),
     }
     out.push_str("Connection: close\r\n\r\n");
 
-    let mut bytes = out.into_bytes();
-    bytes.extend_from_slice(&body);
+    let mut bytes = Vec::with_capacity(out.len() + body_len);
+    bytes.extend_from_slice(out.as_bytes());
+    match h.body_kind {
+        Body::None => {}
+        Body::Chunked => {
+            walk_chunks(h.body, &mut 0, |c| bytes.extend_from_slice(c));
+        }
+        Body::Length(_) | Body::ToEof => bytes.extend_from_slice(&h.body[..body_len]),
+    }
     Ok(bytes)
 }
 
@@ -396,43 +420,82 @@ fn parse_status(line: &str) -> Option<u16> {
     code.parse::<u16>().ok()
 }
 
-/// Decodes a chunked body. Bounded by MAX_RESPONSE. Ignores trailers.
-fn dechunk(data: &[u8]) -> Result<Vec<u8>, ProxyError> {
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    loop {
-        // chunk-size line
-        let nl = data
-            .get(i..)
-            .and_then(|d| d.windows(2).position(|w| w == b"\r\n"))
-            .ok_or(ProxyError::BadResponse)?;
-        let size_line = std::str::from_utf8(&data[i..i + nl]).map_err(|_| ProxyError::BadResponse)?;
-        // a chunk extension (";...") may follow the size; ignore it
-        let hex = size_line.split(';').next().unwrap_or("").trim();
-        if hex.is_empty() || hex.len() > 15 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(ProxyError::BadResponse);
-        }
-        let size = usize::from_str_radix(hex, 16).map_err(|_| ProxyError::BadResponse)?;
-        i += nl + 2;
-        if size == 0 {
-            break; // last chunk; trailers (if any) are ignored
-        }
-        if size > MAX_RESPONSE || out.len() + size > MAX_RESPONSE {
-            return Err(ProxyError::TooLarge);
-        }
-        let end = i.checked_add(size).ok_or(ProxyError::BadResponse)?;
-        if end > data.len() {
-            return Err(ProxyError::BadResponse);
-        }
-        out.extend_from_slice(&data[i..end]);
-        i = end;
-        // each chunk's data is followed by CRLF
-        if data.get(i..i + 2) != Some(b"\r\n") {
-            return Err(ProxyError::BadResponse);
-        }
-        i += 2;
+/// Longest chunk-size line (size plus any extension) and longest trailer
+/// section accepted. Both are tiny in practice; the caps keep a re-scan cheap.
+const MAX_CHUNK_LINE: usize = 4096;
+const MAX_TRAILERS: usize = 16 * 1024;
+
+/// Outcome of walking a chunked body.
+#[derive(Debug, PartialEq, Eq)]
+enum Walk {
+    /// The last chunk and the trailer section (if any) are complete.
+    Done,
+    /// The data stops before the body is complete.
+    More,
+    /// Not valid chunked framing.
+    Bad,
+}
+
+/// Offset of the first CRLF in `data` at or after `from`, relative to `from`.
+fn find_crlf(data: &[u8], from: usize) -> Option<usize> {
+    data.get(from..)?.windows(2).position(|w| w == b"\r\n")
+}
+
+/// The size in a chunk-size line (`1a`, `1a;ext=1`). Strict hex, no sign.
+fn chunk_size(line: &[u8]) -> Option<usize> {
+    let line = std::str::from_utf8(line).ok()?;
+    let hex = line.split(';').next().unwrap_or("").trim_matches(|c| c == ' ' || c == '\t');
+    if hex.is_empty() || hex.len() > 15 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
     }
-    Ok(out)
+    usize::from_str_radix(hex, 16).ok()
+}
+
+/// Walks a chunked body, calling `each` with the data of every complete chunk.
+/// `pos` is where the next chunk-size line starts; it advances past each
+/// complete chunk, so a caller that gets `More` can call again with more data
+/// and the same `pos` (linear overall). Trailers are checked for their end and
+/// otherwise ignored.
+fn walk_chunks(data: &[u8], pos: &mut usize, mut each: impl FnMut(&[u8])) -> Walk {
+    loop {
+        let nl = match find_crlf(data, *pos) {
+            Some(nl) if nl <= MAX_CHUNK_LINE => nl,
+            Some(_) => return Walk::Bad,
+            None if data.len() - (*pos).min(data.len()) > MAX_CHUNK_LINE => return Walk::Bad,
+            None => return Walk::More,
+        };
+        let size = match chunk_size(&data[*pos..*pos + nl]) {
+            Some(n) => n,
+            None => return Walk::Bad,
+        };
+        let start = *pos + nl + 2;
+        if size == 0 {
+            // Trailer section: header lines up to an empty line.
+            let mut t = start;
+            loop {
+                if t - start > MAX_TRAILERS {
+                    return Walk::Bad;
+                }
+                match find_crlf(data, t) {
+                    None => return Walk::More,
+                    Some(0) => return Walk::Done,
+                    Some(n) => t += n + 2,
+                }
+            }
+        }
+        let after = match start.checked_add(size).and_then(|end| end.checked_add(2)) {
+            Some(a) => a,
+            None => return Walk::Bad,
+        };
+        if after > data.len() {
+            return Walk::More;
+        }
+        if &data[after - 2..after] != b"\r\n" {
+            return Walk::Bad; // each chunk's data is followed by CRLF
+        }
+        each(&data[start..after - 2]);
+        *pos = after;
+    }
 }
 
 #[cfg(test)]
@@ -541,10 +604,37 @@ mod tests {
         assert!(out.ends_with("\r\n\r\n"));
     }
 
+    fn walk(data: &[u8]) -> (Walk, Vec<u8>) {
+        let mut out = Vec::new();
+        let w = walk_chunks(data, &mut 0, |c| out.extend_from_slice(c));
+        (w, out)
+    }
+
     #[test]
-    fn dechunk_rejects_garbage() {
-        assert!(dechunk(b"zzzz\r\n").is_err());
-        assert!(dechunk(b"5\r\nhi\r\n").is_err()); // size says 5, only 2 present
+    fn walk_chunks_decodes_and_detects_the_end() {
+        assert_eq!(walk(b"5\r\nhello\r\n6;ext=1\r\n world\r\n0\r\n\r\n"), (Walk::Done, b"hello world".to_vec()));
+        assert_eq!(walk(b"2\r\nok\r\n0\r\nA: 1\r\nB: 2\r\n\r\n").0, Walk::Done, "trailers");
+        // incomplete at every possible cut: never Done, never Bad
+        let full = b"3\r\nabc\r\n0\r\nT: 1\r\n\r\n";
+        for cut in 0..full.len() {
+            assert_eq!(walk(&full[..cut]).0, Walk::More, "cut at {}", cut);
+        }
+        // resuming from `pos` gives the same result as one pass
+        let mut pos = 0;
+        let mut out = Vec::new();
+        assert_eq!(walk_chunks(&full[..9], &mut pos, |c| out.extend_from_slice(c)), Walk::More);
+        assert_eq!(walk_chunks(full, &mut pos, |c| out.extend_from_slice(c)), Walk::Done);
+        assert_eq!(out, b"abc");
+    }
+
+    #[test]
+    fn walk_chunks_rejects_garbage() {
+        assert_eq!(walk(b"zzzz\r\n").0, Walk::Bad);
+        assert_eq!(walk(b"2\r\nhiX\r\n0\r\n\r\n").0, Walk::Bad, "data not followed by CRLF");
+        assert_eq!(walk(&[b'1'; MAX_CHUNK_LINE + 10]).0, Walk::Bad, "endless size line");
+        // a truncated response is refused when framed
+        assert!(frame_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhi", false).is_err());
+        assert!(frame_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", false).is_err(), "chunked twice");
     }
 
     #[test]
@@ -614,10 +704,59 @@ mod tests {
         assert!(!wire.to_lowercase().contains("expect"));
     }
 
+    /// A one-shot backend on loopback: writes `parts` with a pause between
+    /// them, then keeps the connection open (it ignores `Connection: close`).
+    fn scripted_backend(parts: Vec<Vec<u8>>) -> Upstream {
+        use std::net::{Ipv4Addr, TcpListener};
+        let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = l.accept() {
+                let mut sink = [0u8; 4096];
+                let _ = s.read(&mut sink);
+                for p in parts {
+                    let _ = s.write_all(&p);
+                    std::thread::sleep(Duration::from_millis(150));
+                }
+                std::thread::sleep(Duration::from_secs(20));
+            }
+        });
+        Upstream::new(&addr, "p").unwrap()
+    }
+
+    fn get() -> Request {
+        req("GET", vec![("Host", "h")], b"")
+    }
+
     #[test]
-    fn dechunk_huge_size_is_an_error_not_a_panic() {
-        assert!(dechunk(b"ffffffffffffffff\r\nx\r\n0\r\n\r\n").is_err());
-        assert!(dechunk(b"fffffffffffffff\r\nx\r\n0\r\n\r\n").is_err());
-        assert!(dechunk(b"+5\r\nhello\r\n0\r\n\r\n").is_err(), "no sign allowed");
+    fn chunk_data_that_looks_like_the_last_chunk_does_not_end_the_read() {
+        // The first chunk's data ends in "0\r\n" and is followed by its CRLF, so
+        // the bytes read so far end in "0\r\n\r\n" although the body is not over.
+        let up = scripted_backend(vec![
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n7\r\nabc,0\r\n\r\n".to_vec(),
+            b"3\r\nxyz\r\n0\r\n\r\n".to_vec(),
+        ]);
+        let t0 = Instant::now();
+        let out = String::from_utf8(up.forward(&get()).expect("complete response")).unwrap();
+        assert!(out.ends_with("\r\n\r\nabc,0\r\nxyz"), "{:?}", out);
+        assert!(t0.elapsed() < Duration::from_secs(5), "took {:?}", t0.elapsed());
+    }
+
+    #[test]
+    fn chunked_body_with_trailers_ends_without_waiting_for_eof() {
+        let up = scripted_backend(vec![
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\nX-Trailer: 1\r\n\r\n".to_vec(),
+        ]);
+        let t0 = Instant::now();
+        let out = String::from_utf8(up.forward(&get()).expect("complete response")).unwrap();
+        assert!(out.ends_with("Content-Length: 2\r\nConnection: close\r\n\r\nok"), "{:?}", out);
+        assert!(t0.elapsed() < Duration::from_secs(5), "took {:?}", t0.elapsed());
+    }
+
+    #[test]
+    fn huge_chunk_size_is_an_error_not_a_panic() {
+        assert_eq!(walk(b"ffffffffffffffff\r\nx\r\n0\r\n\r\n").0, Walk::Bad);
+        assert_eq!(walk(b"fffffffffffffff\r\nx\r\n0\r\n\r\n").0, Walk::More, "needs more data, no overflow");
+        assert_eq!(walk(b"+5\r\nhello\r\n0\r\n\r\n").0, Walk::Bad, "no sign allowed");
     }
 }

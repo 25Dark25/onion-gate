@@ -47,6 +47,14 @@ pub struct Limits {
     pub memory: usize,
     pub memory_per_circuit: usize,
     pub memory_per_pass: usize,
+    /// `captcha = adaptive`: free passes while calm (adaptive.rs).
+    pub adaptive: bool,
+    /// Arrivals per minute above which the gate goes under attack.
+    pub adaptive_new_per_minute: u32,
+    /// Time without any signal before the gate calms down again.
+    pub adaptive_hold: Duration,
+    /// If this file exists, the gate is under attack (empty = none).
+    pub adaptive_force_file: String,
 }
 
 impl Default for Limits {
@@ -73,6 +81,10 @@ impl Default for Limits {
             memory: limit::MAX_BUFFERED,
             memory_per_circuit: limit::MAX_BUFFERED_PER_CIRCUIT,
             memory_per_pass: limit::MAX_BUFFERED_PER_PASS,
+            adaptive: false,
+            adaptive_new_per_minute: 60,
+            adaptive_hold: Duration::from_secs(15 * 60),
+            adaptive_force_file: String::new(),
         }
     }
 }
@@ -149,6 +161,18 @@ impl Limits {
             self.memory_per_circuit / 2 >= self.max_response.max(self.max_body),
             "memory_per_circuit must be at least twice max_response and max_body",
         );
+        need(
+            (1..=100_000).contains(&self.adaptive_new_per_minute),
+            "adaptive_new_per_minute must be 1 to 100000",
+        );
+        need(
+            (60..=24 * 3600).contains(&self.adaptive_hold.as_secs()),
+            "adaptive_hold must be 1m to 24h",
+        );
+        need(
+            self.adaptive_force_file.is_empty() || self.adaptive_force_file.starts_with('/'),
+            "adaptive_force_file must be an absolute path (or empty)",
+        );
         p
     }
 }
@@ -203,6 +227,10 @@ pub const KEYS: &[(&str, &str)] = &[
     ("memory", "Request and response bytes buffered at once, in total. Over it: 503."),
     ("memory_per_circuit", "The most one circuit may hold of memory. At least 2 x max_response."),
     ("memory_per_pass", "The most one pass may hold of memory."),
+    ("captcha", "always: every new visitor solves the CAPTCHA. adaptive: no CAPTCHA while calm, the CAPTCHA for everyone new while under attack (needs proxy_protocol)."),
+    ("adaptive_new_per_minute", "Adaptive: arrivals (requests without a valid pass) per minute that mean an attack."),
+    ("adaptive_hold", "Adaptive: time without any attack signal before going back to calm."),
+    ("adaptive_force_file", "Adaptive: while this file exists the gate stays under attack (touch it to force the CAPTCHA). Empty: none."),
 ];
 
 impl Config {
@@ -250,6 +278,21 @@ impl Config {
             "memory" => l.memory = size(v).ok_or_else(|| bad("a size (128M)"))?,
             "memory_per_circuit" => l.memory_per_circuit = size(v).ok_or_else(|| bad("a size (24M)"))?,
             "memory_per_pass" => l.memory_per_pass = size(v).ok_or_else(|| bad("a size (32M)"))?,
+            "captcha" => {
+                l.adaptive = match v.to_ascii_lowercase().as_str() {
+                    "always" => false,
+                    "adaptive" => true,
+                    _ => return Err(bad("always or adaptive")),
+                }
+            }
+            "adaptive_new_per_minute" => l.adaptive_new_per_minute = v.parse().map_err(|_| bad("a whole number"))?,
+            "adaptive_hold" => l.adaptive_hold = duration(v).ok_or_else(|| bad("a duration (15m)"))?,
+            "adaptive_force_file" => {
+                if v.contains(char::is_whitespace) {
+                    return Err(bad("a path without spaces"));
+                }
+                l.adaptive_force_file = v.to_string();
+            }
             _ => return Err(format!("unknown setting {:?} (see --help)", key)),
         }
         Ok(())
@@ -281,6 +324,10 @@ impl Config {
             "memory" => show_size(l.memory),
             "memory_per_circuit" => show_size(l.memory_per_circuit),
             "memory_per_pass" => show_size(l.memory_per_pass),
+            "captcha" => (if l.adaptive { "adaptive" } else { "always" }).to_string(),
+            "adaptive_new_per_minute" => l.adaptive_new_per_minute.to_string(),
+            "adaptive_hold" => show_duration(l.adaptive_hold),
+            "adaptive_force_file" => l.adaptive_force_file.clone(),
             _ => unreachable!("every key in KEYS has a value"),
         }
     }
@@ -323,7 +370,8 @@ impl Config {
             if *key == "upstream" && v.is_empty() {
                 s.push_str("upstream = 127.0.0.1:3000\n");
             } else {
-                s.push_str(&format!("{} = {}\n", key, v));
+                s.push_str(format!("{} = {}", key, v).trim_end());
+                s.push('\n');
             }
         }
         s
@@ -334,6 +382,9 @@ impl Config {
         let mut p = Vec::new();
         if self.upstream.is_empty() {
             p.push("upstream is required: the backend to protect, e.g. upstream = 127.0.0.1:3000".to_string());
+        }
+        if self.limits.adaptive && !self.proxy_protocol {
+            p.push("captcha = adaptive needs proxy_protocol = yes: without circuits, a free pass would cost nothing".to_string());
         }
         if self.metrics_port != 0 && self.metrics_port == self.port {
             p.push("metrics_port must differ from port".to_string());
@@ -606,7 +657,7 @@ mod tests {
         let mut c = run(args(&["--upstream=127.0.0.1:3000", "--proxy-protocol", "--pass-idle=45s", "--max-body=1500"]));
         let text = c.to_file();
         for (key, _) in KEYS {
-            assert!(text.contains(&format!("\n{} = ", key)), "{} missing", key);
+            assert!(text.contains(&format!("\n{} =", key)), "{} missing", key);
         }
         let mut back = Config::empty();
         back.apply_file("printed", &text).unwrap();
@@ -623,6 +674,18 @@ mod tests {
         assert!(c.problems().is_empty(), "{:?}", c.problems());
         assert_eq!(c.limits, Limits::default(), "regenerate it with --print-config");
         assert!(c.proxy_protocol && c.upstream == "127.0.0.1:3000" && c.port == 8088);
+    }
+
+    #[test]
+    fn adaptive_mode_settings() {
+        let c = run(args(&["--upstream=127.0.0.1:3000", "--captcha=adaptive", "--proxy-protocol", "--adaptive-hold=30m"]));
+        assert!(c.limits.adaptive && c.limits.adaptive_hold == Duration::from_secs(1800));
+        assert!(c.problems().is_empty(), "{:?}", c.problems());
+        let c = run(args(&["--upstream=127.0.0.1:3000", "--captcha=adaptive"]));
+        assert!(c.problems().iter().any(|p| p.contains("proxy_protocol")), "adaptive needs the PROXY line");
+        assert!(args(&["--captcha=sometimes"]).is_err());
+        let c = run(args(&["--upstream=127.0.0.1:3000", "--adaptive-force-file=relative/path"]));
+        assert!(c.problems().iter().any(|p| p.contains("absolute")));
     }
 
     #[test]

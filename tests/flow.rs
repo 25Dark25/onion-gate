@@ -85,6 +85,7 @@ fn start_custom(linger: bool, memory: Memory) -> (u16, Arc<App>) {
         memory,
         limits: Limits { max_body: 64 * 1024, ..Limits::default() },
         metrics: Default::default(),
+        adaptive: onion_gate::adaptive::Adaptive::new(&Limits::default()),
     });
     let a = Arc::clone(&app);
     thread::spawn(move || {
@@ -381,6 +382,7 @@ fn an_unreachable_backend_is_a_502_not_a_hang() {
         memory: Memory::default(),
         limits: Limits { max_body: 64 * 1024, ..Limits::default() },
         metrics: Default::default(),
+        adaptive: onion_gate::adaptive::Adaptive::new(&Limits::default()),
     });
     let a = Arc::clone(&app);
     thread::spawn(move || {
@@ -597,4 +599,81 @@ fn the_metrics_endpoint_serves_only_metrics() {
     // A client that sends nothing is dropped after the timeout; the next one is served.
     let _idle = TcpStream::connect((Ipv4Addr::LOCALHOST, mport)).unwrap();
     assert!(get("/metrics?x=1").starts_with("HTTP/1.1 200"));
+}
+
+fn adaptive_limits() -> Limits {
+    Limits { adaptive: true, ..Limits::default() }
+}
+
+/// The Location of a 303 and the pass cookie it sets.
+fn free_pass_of(resp: &str) -> (String, String) {
+    assert!(resp.starts_with("HTTP/1.1 303"), "expected a free pass, got:\n{}", &resp[..resp.len().min(300)]);
+    let loc = resp.lines().find_map(|l| l.strip_prefix("Location: ")).unwrap().trim().to_string();
+    (loc, pass_of(resp))
+}
+
+#[test]
+fn adaptive_calm_gives_a_free_pass_that_reaches_the_backend() {
+    let (port, _app) = start_limits(adaptive_limits());
+    let c = 0x0D0D_0001;
+    let (loc, pass) = free_pass_of(&send(port, c, "GET", "/page?x=1", None, None));
+    assert_eq!(loc, "/page?x=1", "back to the same URL");
+    let r = send(port, c, "GET", &loc, Some(&pass), None);
+    assert!(r.contains("BACKEND saw target=/page?x=1"), "{}", r);
+    assert!(r.contains("pass_cookie_present=false"));
+    // A forged or expired pass gets a fresh free pass, not a challenge.
+    assert!(send(port, c, "GET", "/", Some("0123456789abcdef0123456789abcdef"), None).starts_with("HTTP/1.1 303"));
+}
+
+#[test]
+fn a_spent_free_pass_leads_to_the_captcha_not_another_free_pass() {
+    let (port, _app) = start_limits(Limits { pass_burst: 2, pass_per_minute: 1, ..adaptive_limits() });
+    let c = 0x0D0D_0002;
+    let (_, pass) = free_pass_of(&send(port, c, "GET", "/", None, None));
+    for _ in 0..2 {
+        assert!(send(port, c, "GET", "/", Some(&pass), None).contains("BACKEND saw"));
+    }
+    let r = send(port, c, "GET", "/", Some(&pass), None);
+    assert!(is_challenge(&r) && r.contains("Please verify again"), "{}", &r[..r.len().min(300)]);
+}
+
+#[test]
+fn free_passes_cost_challenge_permits() {
+    let (port, _app) = start_limits(Limits { challenge_burst: 2, ..adaptive_limits() });
+    let c = 0x0D0D_0003;
+    for _ in 0..2 {
+        free_pass_of(&send(port, c, "GET", "/", None, None));
+    }
+    assert!(send(port, c, "GET", "/", None, None).starts_with("HTTP/1.1 429"), "a third free pass in a burst");
+    assert!(send(port, 0x0D0D_0004, "GET", "/", None, None).starts_with("HTTP/1.1 303"), "another circuit is unaffected");
+}
+
+#[test]
+fn under_attack_free_passes_are_revoked_and_solved_ones_survive() {
+    use onion_gate::adaptive::{step, Change};
+    use std::time::Instant;
+    let flag = std::env::temp_dir().join(format!("onion-gate-test-force-{}", std::process::id()));
+    let _ = std::fs::remove_file(&flag);
+    let limits = Limits { adaptive_force_file: flag.to_str().unwrap().to_string(), ..adaptive_limits() };
+    let (port, app) = start_limits(limits);
+    let c = 0x0D0D_0005;
+    let t0 = Instant::now();
+    assert_eq!(step(&app, t0), None, "calm to begin with");
+
+    let (_, free) = free_pass_of(&send(port, c, "GET", "/", None, None));
+    // The operator forces the CAPTCHA.
+    std::fs::write(&flag, b"").unwrap();
+    assert!(matches!(step(&app, t0 + Duration::from_secs(5)), Some(Change::Attack(_))));
+    let r = send(port, c, "GET", "/", Some(&free), None);
+    assert!(is_challenge(&r), "the free pass was revoked");
+    let solved = pass_of(&solve(port, &app, c, &r));
+    assert!(is_challenge(&send(port, 0x0D0D_0006, "GET", "/", None, None)), "new visitors get the CAPTCHA");
+    assert!(send(port, c, "GET", "/", Some(&solved), None).contains("BACKEND saw"));
+
+    // Back to calm only after the hold (15 minutes) without any signal.
+    std::fs::remove_file(&flag).unwrap();
+    assert_eq!(step(&app, t0 + Duration::from_secs(600)), None, "still within the hold");
+    assert_eq!(step(&app, t0 + Duration::from_secs(5 + 900 + 5)), Some(Change::Calm));
+    assert!(send(port, 0x0D0D_0007, "GET", "/", None, None).starts_with("HTTP/1.1 303"), "free passes again");
+    assert!(send(port, c, "GET", "/", Some(&solved), None).contains("BACKEND saw"), "the solved pass outlived both changes");
 }

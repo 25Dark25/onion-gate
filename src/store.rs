@@ -46,6 +46,9 @@ pub const PASS_REFILL_PER_SEC: f32 = 1.0;
 
 const MAX_CHALLENGES: usize = 20_000;
 const MAX_PASSES: usize = 20_000;
+/// Free passes may fill at most half the pass store, so solved ones always
+/// have room.
+const MAX_FREE_PASSES: usize = MAX_PASSES / 2;
 const PURGE_EVERY: Duration = Duration::from_secs(1);
 
 pub struct Pending {
@@ -63,6 +66,9 @@ struct Pass {
     issued: Instant,
     last_used: Instant,
     budget: Bucket,
+    /// Issued without a CAPTCHA (adaptive mode, while calm): revoked as a
+    /// group when the gate goes under attack.
+    free: bool,
 }
 
 impl Pass {
@@ -205,10 +211,16 @@ impl Store {
 
     /// Registers a session pass. Returns false if the store is full.
     pub fn add_pass(&self, token: Token) -> bool {
-        self.add_pass_at(Instant::now(), token)
+        self.add_pass_at(Instant::now(), token, false)
     }
 
-    fn add_pass_at(&self, now: Instant, token: Token) -> bool {
+    /// Registers a pass issued without a CAPTCHA (adaptive mode). Returns
+    /// false if the store, or the free passes' half of it, is full.
+    pub fn add_free_pass(&self, token: Token) -> bool {
+        self.add_pass_at(Instant::now(), token, true)
+    }
+
+    fn add_pass_at(&self, now: Instant, token: Token, free: bool) -> bool {
         let mut g = self.lock();
         if g.passes.len() >= MAX_PASSES {
             g.purge(now, &self.pass);
@@ -216,12 +228,17 @@ impl Store {
                 return false;
             }
         }
+        // Counting is only needed once the store could hold that many.
+        if free && g.passes.len() >= MAX_FREE_PASSES && g.passes.values().filter(|p| p.free).count() >= MAX_FREE_PASSES {
+            return false;
+        }
         g.passes.insert(
             token,
             Pass {
                 issued: now,
                 last_used: now,
                 budget: Bucket::full(self.pass.burst, now),
+                free,
             },
         );
         true
@@ -258,6 +275,14 @@ impl Store {
     pub fn pass_alive(&self, token: &Token) -> bool {
         let now = Instant::now();
         self.lock().passes.get(token).is_some_and(|p| p.alive(now, &self.pass))
+    }
+
+    /// Revokes every pass issued without a CAPTCHA; returns how many.
+    pub fn revoke_free_passes(&self) -> usize {
+        let mut g = self.lock();
+        let before = g.passes.len();
+        g.passes.retain(|_, p| !p.free);
+        before - g.passes.len()
     }
 
     /// Revokes a pass (e.g. its circuit went over the page limit).
@@ -411,7 +436,7 @@ mod tests {
     fn pass_idle_timeout_is_sliding() {
         let s = Store::new();
         let t0 = Instant::now();
-        assert!(s.add_pass_at(t0, T1));
+        assert!(s.add_pass_at(t0, T1, false));
         // used every 20 min: it never reaches PASS_IDLE (30 min) of inactivity
         let mut t = t0;
         for _ in 0..4 {
@@ -428,7 +453,7 @@ mod tests {
     fn pass_has_a_hard_lifetime() {
         let s = Store::new();
         let t0 = Instant::now();
-        assert!(s.add_pass_at(t0, T1));
+        assert!(s.add_pass_at(t0, T1, false));
         // kept active every 10 min, it still dies at PASS_MAX
         let mut t = t0;
         while t + Duration::from_secs(10 * 60) < t0 + PASS_MAX {
@@ -443,7 +468,7 @@ mod tests {
     fn pass_budget_exhaustion_revokes_it() {
         let s = Store::new();
         let t0 = Instant::now();
-        assert!(s.add_pass_at(t0, T1));
+        assert!(s.add_pass_at(t0, T1, false));
         for _ in 0..PASS_BURST as usize {
             assert_eq!(s.use_pass_at(t0, &T1), PassUse::Ok);
         }
@@ -458,7 +483,7 @@ mod tests {
     fn pass_budget_refills_at_reading_pace() {
         let s = Store::new();
         let t0 = Instant::now();
-        assert!(s.add_pass_at(t0, T1));
+        assert!(s.add_pass_at(t0, T1, false));
         // one request per second forever never runs out (sustained rate)
         let mut t = t0;
         for _ in 0..200 {
@@ -500,11 +525,11 @@ mod tests {
         for i in 0..MAX_PASSES {
             let mut t = [0u8; 16];
             t[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            assert!(s.add_pass_at(now, t));
+            assert!(s.add_pass_at(now, t, false));
         }
-        assert!(!s.add_pass_at(now, T1), "full store must refuse");
+        assert!(!s.add_pass_at(now, T1, false), "full store must refuse");
         let late = now + PASS_IDLE + Duration::from_secs(5);
-        assert!(s.add_pass_at(late, T1), "expired passes must make room");
+        assert!(s.add_pass_at(late, T1, false), "expired passes must make room");
     }
 
     #[test]
@@ -524,5 +549,21 @@ mod tests {
         assert!(from_hex("0001abff102030405060708090a0b0c0f").is_none()); // 33
         // 30 ASCII + 'e with accent' (2 UTF-8 bytes) = 32 bytes, but not hex
         assert!(from_hex("0001abff102030405060708090a0b0\u{e9}").is_none());
+    }
+
+    #[test]
+    fn free_passes_have_half_the_store_and_go_together() {
+        let s = Store::new();
+        let now = Instant::now();
+        for i in 0..MAX_FREE_PASSES {
+            let mut t = [0u8; 16];
+            t[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            assert!(s.add_pass_at(now, t, true));
+        }
+        assert!(!s.add_free_pass([0xFF; 16]), "free passes are capped at half the store");
+        assert!(s.add_pass([0xEE; 16]), "a solved pass still fits");
+        assert_eq!(s.revoke_free_passes(), MAX_FREE_PASSES);
+        assert!(s.pass_alive(&[0xEE; 16]), "solved passes survive");
+        assert_eq!(s.sizes().1, 1);
     }
 }

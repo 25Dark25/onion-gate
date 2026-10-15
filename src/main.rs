@@ -6,7 +6,7 @@
 
 use onion_gate::config::{self, Action, Config, KEYS};
 use onion_gate::upstream::Upstream;
-use onion_gate::{metrics, serve_connection, App, COOKIE};
+use onion_gate::{adaptive, metrics, serve_connection, App, COOKIE};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
@@ -140,6 +140,11 @@ fn main() {
         },
     };
     let app = Arc::new(App::new(upstream, cfg.proxy_protocol, cfg.limits));
+    if app.adaptive.enabled() {
+        eprintln!("captcha: adaptive (free passes while calm; the CAPTCHA for everyone new under attack)");
+        let a = Arc::clone(&app);
+        thread::spawn(move || adaptive::run(&a));
+    }
     if let Some(m) = metrics_listener {
         eprintln!("metrics on http://127.0.0.1:{}/metrics", cfg.metrics_port);
         let a = Arc::clone(&app);

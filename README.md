@@ -14,10 +14,12 @@ loopback backend you point it at.
 
 > **Status / honesty note.** This project was extracted and adapted from a larger
 > codebase **with the help of an AI assistant (Claude)**. It has **not** had an
-> independent security audit. The CAPTCHA stops casual bots and cheap floods; it
-> does **not** stop a human solver farm or a model trained on this exact
-> generator. Read [Limitations](#limitations) before relying on it. Use it as a
-> speed bump and a rate-limiter, not as a wall.
+> independent security audit. The CAPTCHA stops bots that do not target it and
+> cheap floods; it does **not** stop a solver written for it (a classical one
+> passes about 35 % of the time, see
+> [docs/CAPTCHA-STRENGTH.md](docs/CAPTCHA-STRENGTH.md)), a trained model or a
+> human solver farm. Read [Limitations](#limitations) before relying on it. Use
+> it as a speed bump and a rate-limiter, not as a wall.
 
 ## What it is for
 
@@ -222,6 +224,7 @@ tests/flow.rs    end-to-end tests over real sockets (gate, forwarding, limits, n
 examples/        local test harness: a test backend and a stand-in for tor's PROXY line
 scripts/         harness.sh: automated checks against the real binaries, and a stack for a browser
 docs/TESTING.md  how to test: cargo test, the harness, and the Tor Browser (Safest) checklist
+docs/CAPTCHA-STRENGTH.md  the CAPTCHA measured against a reference solver
 deploy/          example torrc and a hardened systemd unit
 .github/         CI (tests on Linux and macOS, MSRV and stable) and Dependabot
 ```
@@ -251,9 +254,14 @@ Guarantees (as far as the code goes):
 
 Be honest with yourself about what this is:
 
-- **Not resistant to a trained model or a human solver farm.** Anyone with this
-  generator can produce unlimited labelled data; anyone can pay people to click.
-  The CAPTCHA raises the cost of automation, it does not make it impossible.
+- **Not resistant to a solver written for it.** A classical reference solver,
+  with no machine learning, clicks the right ring in 59 % of rounds, so it
+  obtains a pass about 35 % of the time (measured on 2000 challenges, see
+  [docs/CAPTCHA-STRENGTH.md](docs/CAPTCHA-STRENGTH.md)). A model trained on this
+  generator's unlimited labelled output would likely do better, and anyone can
+  pay people to click. The CAPTCHA raises the cost of automation, it does not
+  make it impossible: against a solver, the per-pass and per-circuit budgets
+  are what hold, and against many circuits, tor's proof-of-work.
 - **No independent audit.** The code was written with AI help and reviewed by its
   author only. Read it before you trust it.
 - **Passes are transferable.** A pass is a bearer cookie, not bound to a circuit;

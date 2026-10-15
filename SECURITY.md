@@ -17,7 +17,7 @@ Use **Security → Advisories → Report a vulnerability** on the repository pag
 
 ## Out of scope
 
-- Solving the CAPTCHA with a model trained on this generator, or with paid human solvers. This is a documented limitation: the gate raises the cost of automation, it does not prevent it.
+- Solving the CAPTCHA automatically (a classical solver already passes about 35 % of the time, see [docs/CAPTCHA-STRENGTH.md](docs/CAPTCHA-STRENGTH.md)), with a model trained on this generator, or with paid human solvers. This is a documented limitation: the gate raises the cost of automation, it does not prevent it. A solver that gets around the per-pass or per-circuit **limits** is in scope.
 - Floods from many Tor circuits at once. That is tor's job (proof-of-work and introduction defenses); the per-circuit limits here only bound what each circuit can do.
 - Sharing or reselling a valid pass. Passes are bearer cookies by design; their budget and lifetime are the only limit.
 - Vulnerabilities in the backend behind the gate, in tor, or in the operating system.

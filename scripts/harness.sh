@@ -31,6 +31,7 @@ BROWSER_PORT=${BROWSER_PORT:-18080}
 # `check` runs its own stack on other ports, so it never touches one from `up`.
 CHECK_BACKEND_PORT=13001
 CHECK_GATE_PORT=18089
+CHECK_METRICS_PORT=18099
 
 PIDS=""
 PASSED=0
@@ -79,11 +80,14 @@ wait_port() {
     done
 }
 
-start_stack() { # backend_port gate_port
-    spawn "$BIN/examples/test_backend" "$1"
-    wait_port "$1"
-    spawn "$BIN/onion-gate" "$2" --proxy-protocol "--upstream=127.0.0.1:$1"
-    wait_port "$2"
+start_stack() { # backend_port gate_port [more gate flags]
+    b=$1
+    g=$2
+    shift 2
+    spawn "$BIN/examples/test_backend" "$b"
+    wait_port "$b"
+    spawn "$BIN/onion-gate" "$g" --proxy-protocol "--upstream=127.0.0.1:$b" "$@"
+    wait_port "$g"
 }
 
 # The IPv4 address whose 32 bits are circuit $1 (the gate reads a TCP4 PROXY
@@ -135,7 +139,9 @@ cmd_check() {
     need_curl
     build
     G=$CHECK_GATE_PORT
-    start_stack "$CHECK_BACKEND_PORT" "$G"
+    M=$CHECK_METRICS_PORT
+    start_stack "$CHECK_BACKEND_PORT" "$G" "--metrics-port=$M"
+    wait_port "$M"
     CHALLENGE="Click the broken circle."
     BACKEND_MARK="the gate let you through"
 
@@ -223,7 +229,19 @@ cmd_check() {
     r=$(gate "$G" 20 -o /dev/null -w '%{http_code}')
     expect "circuit 20: served again once they close" [ "$r" = 200 ]
 
-    # 10. The binary refuses a non-loopback or self-pointing upstream and bad flags.
+    # 10. Metrics: the counters saw what happened above, and hold no visitor data.
+    page=$(curl -sS --max-time 10 "http://127.0.0.1:$M/metrics")
+    metric() { printf '%s\n' "$page" | awk -v n="$1" '$1 == n { print $2 }'; }
+    expect "metrics: challenges counted" [ "$(metric onion_gate_challenges_total)" -ge 20 ]
+    expect "metrics: failed verifications counted" [ "$(metric 'onion_gate_verifications_total{result="failed"}')" -ge 3 ]
+    expect "metrics: challenge 429s counted" [ "$(metric 'onion_gate_rate_limited_total{limit="challenge"}')" -ge 1 ]
+    expect "metrics: connection 429s counted" [ "$(metric 'onion_gate_rate_limited_total{limit="conn_per_circuit"}')" -ge 1 ]
+    expect "metrics: missing PROXY line counted" [ "$(metric onion_gate_proxy_line_rejected_total)" -ge 1 ]
+    expect "metrics: no path or circuit in them" lacks "$page" "does-not-exist"
+    r=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$M/")
+    expect "metrics port: anything but /metrics is 404" [ "$r" = 404 ]
+
+    # 11. The binary refuses a non-loopback or self-pointing upstream and bad flags.
     set +e
     "$BIN/onion-gate" 18090 --upstream=10.0.0.1:80 >/dev/null 2>&1
     expect "non-loopback upstream refused" [ $? -ne 0 ]

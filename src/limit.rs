@@ -203,6 +203,11 @@ impl Limiter {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// How many circuits are remembered: for the metrics.
+    pub fn tracked(&self) -> usize {
+        self.lock().map.len()
+    }
+
     /// Reserves a connection slot for the circuit. None = limit exceeded.
     pub fn enter(&self, circuit: u32) -> Option<ConnSlot<'_>> {
         let now = Instant::now();

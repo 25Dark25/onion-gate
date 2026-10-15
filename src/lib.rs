@@ -27,6 +27,7 @@ pub mod fuzz;
 pub mod html;
 pub mod http;
 pub mod limit;
+pub mod metrics;
 pub mod png;
 pub mod rng;
 pub mod store;
@@ -35,6 +36,7 @@ pub mod upstream;
 use http::{HttpError, Reply, Request};
 use config::Limits;
 use limit::{Limiter, Memory, Owner, Reservation};
+use metrics::Metrics;
 use rng::Rng;
 use std::net::TcpStream;
 use store::{PassUse, Store, Token};
@@ -77,6 +79,8 @@ pub struct App {
     /// The configured limits (rounds, challenge lifetime, body cap, ...). The
     /// store, limiter, memory budget and upstream above were built from them.
     pub limits: Limits,
+    /// Aggregate counters (metrics.rs). No visitor data.
+    pub metrics: Metrics,
 }
 
 impl App {
@@ -89,6 +93,7 @@ impl App {
             proxy,
             memory: Memory::from_limits(&limits),
             limits,
+            metrics: Metrics::default(),
         }
     }
 }
@@ -146,7 +151,11 @@ fn method_not_allowed(allow: &'static str) -> Reply {
 
 /// Every image costs CPU: generating one consumes a circuit challenge permit.
 fn challenge_allowed(app: &App, circuit: Option<u32>) -> bool {
-    circuit.is_none_or(|c| app.limiter.take(c))
+    let ok = circuit.is_none_or(|c| app.limiter.take(c));
+    if !ok {
+        app.metrics.limited_challenges.inc();
+    }
+    ok
 }
 
 // --------------------------------------------------------------- serving
@@ -158,6 +167,7 @@ pub fn serve_connection(stream: &mut TcpStream, app: &App) {
         match http::read_proxy(stream) {
             Ok((c, rest)) => (Some(c), rest),
             Err(_) => {
+                app.metrics.proxy_rejected.inc();
                 http::close(stream);
                 return;
             }
@@ -170,6 +180,7 @@ pub fn serve_connection(stream: &mut TcpStream, app: &App) {
         Some(c) => match app.limiter.enter(c) {
             Some(slot) => Some(slot),
             None => {
+                app.metrics.limited_connections.inc();
                 http::send(stream, &too_many());
                 http::close(stream);
                 return;
@@ -202,11 +213,18 @@ pub fn serve_connection(stream: &mut TcpStream, app: &App) {
             // A relayed HEAD response is already body-less (upstream.rs).
             Out::Raw(bytes, _held) => http::send_raw(stream, &bytes),
         },
-        Err(e) => match error_reply(&e) {
-            Some(reply) if head_request => http::send_head(stream, &reply),
-            Some(reply) => http::send(stream, &reply),
-            None => {}
-        },
+        Err(e) => {
+            match e.status() {
+                Some(503) => app.metrics.memory_busy.inc(),
+                Some(_) => app.metrics.bad_requests.inc(),
+                None => {}
+            }
+            match error_reply(&e) {
+                Some(reply) if head_request => http::send_head(stream, &reply),
+                Some(reply) => http::send(stream, &reply),
+                None => {}
+            }
+        }
     }
     http::close(stream);
 }
@@ -300,21 +318,42 @@ fn gated<'a>(req: &Request, circuit: Option<u32>, app: &'a App) -> Out<'a> {
     match app.store.use_pass(&pass) {
         PassUse::Ok => {}
         PassUse::Invalid => return Out::Reply(gate(app, circuit, "", ret, true)),
-        PassUse::Exhausted => return Out::Reply(gate(app, circuit, MSG_RATE, ret, true)),
+        PassUse::Exhausted => {
+            app.metrics.revoked_pass_budget.inc();
+            return Out::Reply(gate(app, circuit, MSG_RATE, ret, true));
+        }
     }
     // The circuit's own page budget (catches several passes on one circuit).
     if let Some(c) = circuit {
         if !app.limiter.take_page(c) {
+            app.metrics.revoked_circuit_budget.inc();
             app.store.revoke_pass(&pass);
             return Out::Reply(gate(app, circuit, MSG_RATE, ret, true));
         }
     }
 
     // Valid pass: forward to the backend.
-    match app.upstream.forward(req, &app.memory, &owners(circuit, &pass)) {
-        Ok((bytes, held)) => Out::Raw(bytes, held),
-        Err(upstream::ProxyError::Busy) => Out::Reply(Reply::page(503, html::message(MSG_BUSY))),
-        Err(e) => Out::Reply(Reply::page(e.status(), html::message(MSG_GATEWAY))),
+    let m = &app.metrics;
+    let started = std::time::Instant::now();
+    let result = app.upstream.forward(req, &app.memory, &owners(circuit, &pass));
+    m.upstream_micros.add(started.elapsed().as_micros() as u64);
+    match result {
+        Ok((bytes, held)) => {
+            m.forwarded.inc();
+            Out::Raw(bytes, held)
+        }
+        Err(e) => {
+            use upstream::ProxyError as P;
+            match e {
+                P::Busy => m.memory_busy.inc(),
+                P::Connect => m.upstream_connect.inc(),
+                P::Timeout => m.upstream_timeout.inc(),
+                P::BadResponse => m.upstream_bad_response.inc(),
+                P::TooLarge => m.upstream_too_large.inc(),
+            }
+            let msg = if matches!(e, P::Busy) { MSG_BUSY } else { MSG_GATEWAY };
+            Out::Reply(Reply::page(e.status(), html::message(msg)))
+        }
     }
 }
 
@@ -339,8 +378,10 @@ fn new_challenge(app: &App, rounds_left: u8, notice: &str, ret: String) -> Reply
     let ch = captcha::generate(&mut rng);
     let token = rng.token();
     if !app.store.add_challenge(token, ch.secret, rounds_left, ret) {
+        app.metrics.store_full.inc();
         return Reply::page(503, html::message(MSG_BUSY));
     }
+    app.metrics.challenges.inc();
     let page = html::challenge(
         &html::base64(&ch.png),
         &store::to_hex(&token),
@@ -362,7 +403,10 @@ fn verify(req: &Request, app: &App) -> Reply {
         .and_then(|t| store.take_challenge(&t));
     let pending = match pending {
         Some(p) => p,
-        None => return new_challenge(app, app.limits.rounds, MSG_FAIL, "/".to_string()),
+        None => {
+            app.metrics.verify_failed.inc();
+            return new_challenge(app, app.limits.rounds, MSG_FAIL, "/".to_string());
+        }
     };
 
     // 2) Strict coordinates; anything odd = generic failure.
@@ -376,9 +420,11 @@ fn verify(req: &Request, app: &App) -> Reply {
     // 3) Same message for every failure: the reason is never revealed. A
     //    failure restarts from round 1 with a new image, keeping the return path.
     if !ok {
+        app.metrics.verify_failed.inc();
         return new_challenge(app, app.limits.rounds, MSG_FAIL, pending.ret);
     }
     if pending.rounds_left > 1 {
+        app.metrics.verify_next_round.inc();
         return new_challenge(app, pending.rounds_left - 1, MSG_NEXT, pending.ret);
     }
 
@@ -386,8 +432,10 @@ fn verify(req: &Request, app: &App) -> Reply {
     let mut rng = Rng::new();
     let pass = rng.token();
     if !store.add_pass(pass) {
+        app.metrics.store_full.inc();
         return Reply::page(503, html::message(MSG_BUSY));
     }
+    app.metrics.verify_passed.inc();
     let mut r = Reply::redirect(pending.ret);
     r.extra.push(("Set-Cookie", pass_cookie(&pass)));
     r

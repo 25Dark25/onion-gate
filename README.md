@@ -185,6 +185,7 @@ sooner. The circuit budget must stay looser than the pass budget.
 | `port` | 8088 | Port on 127.0.0.1 |
 | `upstream` | — (required) | The backend, `host:port`, on loopback |
 | `proxy_protocol` | no | Read tor's PROXY line: per-circuit limits. **Use `yes` behind tor** |
+| `metrics_port` | 0 (off) | Port on 127.0.0.1 for aggregate [metrics](#metrics) |
 | `rounds` | 2 | CAPTCHA rounds in a row for a pass (1–5) |
 | `challenge_ttl` | 30s | How long a challenge image is valid (+5 s grace for Tor latency) |
 | `pass_idle` / `pass_max` | 30m / 2h | A pass expires when unused this long / this long after it was issued |
@@ -207,6 +208,47 @@ Fixed in the code on purpose (protocol hardening, not tuning):
 | Time to deliver one response | 30 s + size at 16 KiB/s, at most 300 s | `SEND_GRACE`, `MIN_SEND_RATE`, `SEND_DEADLINE` in `src/http.rs` |
 | Image difficulty | — | constants at the top of `src/captcha.rs` |
 | CAPTCHA page text and style | — | `src/html.rs` |
+
+## Metrics
+
+With `metrics_port` set, onion-gate serves aggregate counters at
+`http://127.0.0.1:PORT/metrics`, in the Prometheus text format: read them with
+`curl`, or point Prometheus (or anything that reads that format) at them.
+
+```bash
+onion-gate --config=/etc/onion-gate/onion-gate.conf --metrics-port=9180
+curl -s http://127.0.0.1:9180/metrics | grep -v '^#'
+```
+
+| Metric | What it counts |
+| --- | --- |
+| `onion_gate_challenges_total` | Challenge images generated |
+| `onion_gate_verifications_total{result}` | CAPTCHA answers: `failed`, `next_round`, `passed` (= passes issued) |
+| `onion_gate_rate_limited_total{limit}` | 429s: `conn_per_circuit`, `challenge` |
+| `onion_gate_passes_revoked_total{budget}` | Passes revoked for spending the `pass` or the `circuit` budget |
+| `onion_gate_forwarded_total` | Requests forwarded and answered |
+| `onion_gate_upstream_errors_total{kind}` | Backend failures: `connect`, `timeout`, `bad_response`, `too_large` |
+| `onion_gate_upstream_seconds_total` | Time spent waiting for the backend (divide by forwarded for the mean) |
+| `onion_gate_busy_total{resource}` | 503s: `memory` budget or a `store` full |
+| `onion_gate_bad_requests_total`, `onion_gate_proxy_line_rejected_total` | Requests the parser refused; connections without a valid PROXY line |
+| `onion_gate_connections_total{result}`, `onion_gate_connections_open` | Connections accepted or refused for `max_conn`; open now |
+| `onion_gate_challenges_pending`, `onion_gate_passes_live`, `onion_gate_circuits_tracked` | How full the stores are |
+| `onion_gate_memory_bytes{kind}` | Buffered bytes `used`, and the `limit` |
+| `onion_gate_uptime_seconds`, `onion_gate_info{version}` | Since when, and which version |
+
+**No visitor data, by design:** only totals. Never a circuit identifier, a
+path, a cookie, a header or the time of any one request, and nothing is
+written to disk. The endpoint listens on `127.0.0.1` only and answers one
+scrape at a time; never point tor at it. (Dumping the counters on a Unix
+signal is not offered: the standard library cannot catch signals without
+`unsafe` code, which this crate forbids.)
+
+What an attack looks like in them: `challenges_total` and
+`rate_limited_total{limit="challenge"}` climbing fast with few
+`verifications_total{result="passed"}`; `circuits_tracked` growing (many
+circuits: tor's proof-of-work is the answer); `busy_total` or
+`memory_bytes{kind="used"}` near the limit; `upstream_seconds_total` rising
+faster than `forwarded_total` (the backend is struggling).
 
 ## Download and verify a release
 
@@ -255,6 +297,7 @@ visitor address: anything it did per IP (rate limits, logs) now sees
 src/lib.rs       the gate: routing, the challenge/verify flow, forwarding, return-path safety
 src/main.rs      the binary: configuration, --check/--print-config, loopback bind, accept loop
 src/config.rs    settings: defaults, the file and flag parser, validation
+src/metrics.rs   aggregate counters and the loopback /metrics endpoint
 src/captcha.rs   challenge drawing, distortion, click validation
 src/store.rs     single-use challenge tokens, session passes and their budget
 src/limit.rs     per-Tor-circuit limits (connections, challenges, pages) and the token bucket

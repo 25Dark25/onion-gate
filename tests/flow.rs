@@ -7,7 +7,7 @@ use onion_gate::config::Limits;
 use onion_gate::store::{from_hex, to_hex, Store, Token};
 use onion_gate::upstream::Upstream;
 use onion_gate::limit::{Memory, Owner, MAX_BUFFERED_PER_CIRCUIT};
-use onion_gate::{captcha, limit::Limiter, serve_connection, App, COOKIE};
+use onion_gate::{captcha, limit::Limiter, metrics, serve_connection, App, COOKIE};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::sync::Arc;
@@ -84,6 +84,7 @@ fn start_custom(linger: bool, memory: Memory) -> (u16, Arc<App>) {
         proxy: true,
         memory,
         limits: Limits { max_body: 64 * 1024, ..Limits::default() },
+        metrics: Default::default(),
     });
     let a = Arc::clone(&app);
     thread::spawn(move || {
@@ -379,6 +380,7 @@ fn an_unreachable_backend_is_a_502_not_a_hang() {
         proxy: true,
         memory: Memory::default(),
         limits: Limits { max_body: 64 * 1024, ..Limits::default() },
+        metrics: Default::default(),
     });
     let a = Arc::clone(&app);
     thread::spawn(move || {
@@ -534,4 +536,65 @@ fn configured_circuit_and_pass_budgets_are_used() {
     }
     let r = send(port, c, "GET", "/p", Some(&pass), None);
     assert!(!r.contains("BACKEND saw"), "pass_burst = 3: the 4th request must not reach the backend");
+}
+
+/// The value of one sample in a metrics page.
+fn sample(page: &str, name: &str) -> u64 {
+    page.lines()
+        .find_map(|l| l.strip_prefix(name).and_then(|r| r.strip_prefix(' ')))
+        .unwrap_or_else(|| panic!("no sample {}", name))
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn metrics_count_the_flow_and_hold_no_visitor_data() {
+    let (port, app) = start_limits(Limits::default());
+    let c = 0xDEAD_BEEF;
+    let first = send(port, c, "GET", "/private-path-1234?q=secret", None, None);
+    let pass = pass_of(&solve(port, &app, c, &first));
+    for _ in 0..2 {
+        assert!(send(port, c, "GET", "/private-path-1234", Some(&pass), None).contains("BACKEND saw"));
+    }
+    send_raw(port, c, "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n"); // two Host: 400
+    let page = metrics::render(&app);
+
+    assert_eq!(sample(&page, "onion_gate_challenges_total"), 2, "one image per round");
+    assert_eq!(sample(&page, "onion_gate_verifications_total{result=\"next_round\"}"), 1);
+    assert_eq!(sample(&page, "onion_gate_verifications_total{result=\"passed\"}"), 1);
+    assert_eq!(sample(&page, "onion_gate_verifications_total{result=\"failed\"}"), 0);
+    assert_eq!(sample(&page, "onion_gate_forwarded_total"), 2);
+    assert_eq!(sample(&page, "onion_gate_bad_requests_total"), 1);
+    assert_eq!(sample(&page, "onion_gate_passes_live"), 1);
+    assert_eq!(sample(&page, "onion_gate_circuits_tracked"), 1);
+
+    // Nothing about the visitor: not the circuit, the path, the query or the pass.
+    for secret in ["private-path", "secret", &pass, "deadbeef", "3735928559", "222.173.190.239"] {
+        assert!(!page.to_lowercase().contains(&secret.to_lowercase()), "{:?} in the metrics", secret);
+    }
+}
+
+#[test]
+fn the_metrics_endpoint_serves_only_metrics() {
+    let (_, app) = start_limits(Limits::default());
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let mport = listener.local_addr().unwrap().port();
+    let a = Arc::clone(&app);
+    thread::spawn(move || metrics::serve(listener, &a));
+    let get = |target: &str| {
+        let mut s = TcpStream::connect((Ipv4Addr::LOCALHOST, mport)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(format!("GET {} HTTP/1.1\r\nHost: x\r\n\r\n", target).as_bytes()).unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        out
+    };
+    let r = get("/metrics");
+    assert!(r.starts_with("HTTP/1.1 200 OK\r\n") && r.contains("text/plain; version=0.0.4"), "{}", r);
+    assert!(r.contains("# TYPE onion_gate_challenges_total counter"));
+    assert!(get("/").starts_with("HTTP/1.1 404"));
+    assert!(get("/metrics/../x").starts_with("HTTP/1.1 404"));
+    // A client that sends nothing is dropped after the timeout; the next one is served.
+    let _idle = TcpStream::connect((Ipv4Addr::LOCALHOST, mport)).unwrap();
+    assert!(get("/metrics?x=1").starts_with("HTTP/1.1 200"));
 }

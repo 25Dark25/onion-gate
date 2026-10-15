@@ -32,9 +32,9 @@ not meant for production:
 
 ### `scripts/harness.sh check`
 
-Builds, starts a backend and a gate (with `--proxy-protocol`) on ports 13001
-and 18089, runs the checks below with curl, and stops everything. CI runs it on
-Linux.
+Builds, starts a backend and a gate (with `--proxy-protocol` and metrics) on
+ports 13001, 18089 and 18099, runs the checks below with curl, and stops
+everything. CI runs it on Linux.
 
 - without a pass, every path is the challenge (`200`), with nothing of the
   backend in it;
@@ -51,6 +51,8 @@ Linux.
   another circuit is still served;
 - per circuit: 8 connections held open, the 9th gets `429`; it is served again
   once they close;
+- the metrics (on port 18099) counted the challenges, failures, 429s and the
+  missing PROXY line above, show no path, and serve nothing but `/metrics`;
 - the binary refuses a non-loopback upstream, an upstream on its own port, and
   unknown flags.
 

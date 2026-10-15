@@ -1,0 +1,22 @@
+# Build output
+/target/
+**/*.rs.bk
+
+# Logs
+*.log
+
+# Release archives and their signatures (built and signed outside the repo)
+*.zip
+*.tar.gz
+*.asc
+SHA256SUMS*
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# Operating systems
+.DS_Store
+Thumbs.db

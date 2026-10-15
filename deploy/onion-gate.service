@@ -1,0 +1,42 @@
+# Hardened systemd unit for onion-gate.
+#
+# Adjust the port, the --upstream address and the binary path to your setup,
+# then:
+#   sudo cp onion-gate /usr/local/bin/
+#   sudo cp deploy/onion-gate.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now onion-gate
+#
+# This unit assumes tor is configured with HiddenServiceExportCircuitID haproxy
+# (see torrc.example), hence --proxy-protocol. Point --upstream at YOUR backend,
+# which must listen on loopback.
+
+[Unit]
+Description=onion-gate (CAPTCHA gate + reverse proxy)
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/onion-gate 8088 --proxy-protocol --upstream=127.0.0.1:3000
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+# onion-gate listens on loopback and only connects to a loopback upstream.
+IPAddressAllow=localhost
+IPAddressDeny=any
+TasksMax=512
+MemoryMax=256M
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

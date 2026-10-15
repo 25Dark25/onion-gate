@@ -1,0 +1,11 @@
+# Normalize text to LF in the repository and in every checkout, including
+# Windows: the HTTP code and tests compare exact bytes ("\r\n" is written
+# explicitly), so a checkout must never rewrite line endings.
+* text=auto eol=lf
+
+# Binary files: never convert, never diff as text.
+*.png binary
+*.zip binary
+*.gz binary
+# No data file in this repository needs an exact hash today; add `-text` here
+# for any fixture whose bytes must be preserved exactly.

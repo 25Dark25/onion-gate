@@ -1,0 +1,67 @@
+name: tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # Unix only: randomness comes from /dev/urandom and the build refuses
+        # other targets (see src/lib.rs), so there is no Windows job.
+        os: [ubuntu-latest, macos-latest]
+        # The minimum supported version (rust-version in Cargo.toml) and the latest.
+        rust: ["1.82.0", stable]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # rustup ships with the runner images: no third-party action needed.
+      - name: Install Rust ${{ matrix.rust }}
+        env:
+          RUST: ${{ matrix.rust }}
+        run: |
+          rustup toolchain install "$RUST" --profile minimal --component clippy --no-self-update
+          rustup default "$RUST"
+          rustc --version
+      - name: No third-party dependencies
+        run: |
+          # cargo tree on its own line: a failure (e.g. a dependency added without
+          # updating Cargo.lock) must fail the step, not be masked by the pipe.
+          tree=$(cargo tree --locked --offline --target all -e normal,build,dev --prefix none)
+          others=$(printf '%s\n' "$tree" | sort -u | grep -v '^onion-gate v' || true)
+          if [ -n "$others" ]; then
+            echo "Dependencies found:"
+            echo "$others"
+            exit 1
+          fi
+          test "$(grep -c '^\[\[package\]\]' Cargo.lock)" = 1
+      - run: cargo test --locked --offline
+      - name: Clippy (no warnings)
+        if: matrix.rust == 'stable'
+        run: cargo clippy --locked --offline --all-targets -- -D warnings
+      - run: cargo build --release --locked --offline
+
+  # Single stable check for the branch ruleset: it fails if any matrix job failed or was cancelled.
+  all-tests:
+    if: always()
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every test job passed
+        env:
+          RESULT: ${{ needs.test.result }}
+        run: |
+          echo "test matrix: $RESULT"
+          test "$RESULT" = "success"

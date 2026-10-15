@@ -1,0 +1,18 @@
+# Example tor configuration for putting onion-gate in front of a backend.
+#
+# The key line is HiddenServiceExportCircuitID haproxy: it makes tor prepend a
+# PROXY v1 line to every connection, carrying a per-circuit identifier.
+# onion-gate reads it (with --proxy-protocol) to apply its per-circuit limits.
+# Without this line, onion-gate still works but can only apply the per-pass
+# limit (every visitor looks like the same circuit).
+
+HiddenServiceDir /var/lib/tor/onion-gate/
+HiddenServiceVersion 3
+# Visitors reach the .onion on port 80; tor forwards to onion-gate on loopback.
+HiddenServicePort 80 127.0.0.1:8088
+HiddenServiceExportCircuitID haproxy
+
+# Optional hardening (recommended for a service that only serves a hidden
+# service and makes no outbound connections of its own):
+# SocksPort 0
+# Keep onion-gate and the backend bound to 127.0.0.1 only.

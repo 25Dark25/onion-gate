@@ -1,0 +1,8 @@
+version: 2
+updates:
+  # Keeps the SHA-pinned actions in .github/workflows up to date.
+  # No cargo entry: the crate has no dependencies (CI enforces it).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

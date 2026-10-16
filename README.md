@@ -363,6 +363,7 @@ examples/        local test harness: a test backend and a stand-in for tor's PRO
 scripts/         harness.sh: automated checks against the real binaries, and a stack for a browser
 docs/TESTING.md  how to test: cargo test, the harness, and the Tor Browser (Safest) checklist
 docs/CAPTCHA-STRENGTH.md  the CAPTCHA measured against a reference solver
+docs/RELEASING.md  how a release is built, signed and published
 deploy/          example configuration, torrc and a hardened systemd unit
 .github/         CI (tests on Linux and macOS, MSRV and stable) and Dependabot
 ```

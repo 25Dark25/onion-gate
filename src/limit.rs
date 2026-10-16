@@ -16,30 +16,14 @@
 //! circuit goes through tor's defenses (PoW included).
 //! Policy: when in doubt, deny (fail-closed).
 //!
-//! The constants below are the defaults; the configuration (config.rs) can
-//! change them, and checks the rules between them at start-up.
+//! The limits are settings (config.rs, with their defaults and reasons); the
+//! configuration checks the rules between them at start-up.
 
 use crate::config::Limits;
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-/// Connections open at the same time from one circuit. There is no keep-alive,
-/// so every request of a page (HTML, CSS, scripts, images) is its own
-/// connection; browsers open about 6 in parallel per host. 8 leaves margin while
-/// still bounding how many slow connections one circuit can hold (slowloris).
-pub const MAX_CONN_PER_CIRCUIT: u16 = 8;
-/// Challenges a circuit may request in one burst...
-pub const CHALLENGE_BURST: f32 = 10.0;
-/// ...and the sustained rate: 1 every 6 s (10 per minute).
-pub const CHALLENGE_REFILL_PER_SEC: f32 = 1.0 / 6.0;
-/// Forwarded requests a circuit may make in one burst (a page and its assets,
-/// several tabs at once)...
-pub const CIRCUIT_PAGE_BURST: f32 = 90.0;
-/// ...and the sustained rate: 1.5 per second (90 per minute). Deliberately
-/// looser than the per-pass limit (store.rs), so an honest visitor never hits
-/// this one first.
-pub const CIRCUIT_PAGE_REFILL_PER_SEC: f32 = 1.5;
 /// Maximum number of circuits remembered (bounded memory).
 const MAX_ENTRIES: usize = 50_000;
 /// A circuit idle for this long is forgotten. Must be at least the time any
@@ -252,21 +236,13 @@ impl Limiter {
 
 // ------------------------------------------------------------ memory budget
 
-/// Request and response bytes buffered at once, across all connections. Every
-/// forwarded request and its response are held in memory (see upstream.rs);
-/// without a global bound, a few visitors with a valid pass fetching large
-/// files in parallel could exhaust the process's memory. Over the budget, the
-/// visitor gets a 503 instead.
-pub const MAX_BUFFERED: usize = 128 * 1024 * 1024;
-/// The most one Tor circuit may hold of that budget. Without it, one circuit's
-/// 8 connections, each holding a large response for a slow reader, could take
-/// half the budget. 24 MiB fits one maximal response (8 MiB, counted twice
-/// while it is re-framed) next to a page's ordinary assets.
-pub const MAX_BUFFERED_PER_CIRCUIT: usize = 24 * 1024 * 1024;
-/// The most one pass may hold, whatever circuits it is used from (a pass is not
-/// bound to a circuit). Filling the whole budget then takes at least
-/// MAX_BUFFERED / MAX_BUFFERED_PER_PASS passes, each a solved CAPTCHA.
-pub const MAX_BUFFERED_PER_PASS: usize = 32 * 1024 * 1024;
+// The budget and its shares are settings (`memory`, `memory_per_circuit`,
+// `memory_per_pass`; defaults and reasons in config.rs). Every forwarded
+// request and its response are held in memory (see upstream.rs): without a
+// global bound, a few visitors fetching large files in parallel could exhaust
+// the process; over the budget, the visitor gets a 503 instead. The per-circuit
+// share stops one circuit's slow connections from holding much of it; the
+// per-pass share does the same for a pass used from many circuits.
 
 /// Who a reservation is charged to, besides the global budget.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -293,14 +269,15 @@ pub struct Memory {
 
 impl Default for Memory {
     fn default() -> Self {
-        Self::with_shares(MAX_BUFFERED, MAX_BUFFERED_PER_CIRCUIT, MAX_BUFFERED_PER_PASS)
+        Self::from_limits(&Limits::default())
     }
 }
 
 impl Memory {
     /// A budget of `max` bytes with the default per-circuit and per-pass shares.
     pub fn new(max: usize) -> Memory {
-        Self::with_shares(max, MAX_BUFFERED_PER_CIRCUIT, MAX_BUFFERED_PER_PASS)
+        let d = Limits::default();
+        Self::with_shares(max, d.memory_per_circuit, d.memory_per_pass)
     }
 
     /// The configured budget and shares.
@@ -428,6 +405,11 @@ impl Drop for Reservation<'_> {
 mod tests {
     use super::*;
 
+    // The default settings, for the tests.
+    const MAX_CONN_PER_CIRCUIT: u16 = 8;
+    const CHALLENGE_BURST: usize = 10;
+    const CIRCUIT_PAGE_BURST: usize = 90;
+
     #[test]
     fn memory_budget_is_shared_and_released() {
         let m = Memory::new(100);
@@ -481,7 +463,7 @@ mod tests {
     fn burst_and_refill() {
         let l = Limiter::new();
         let t0 = Instant::now();
-        for _ in 0..CHALLENGE_BURST as usize {
+        for _ in 0..CHALLENGE_BURST {
             assert!(l.take_at(t0, 1));
         }
         assert!(!l.take_at(t0, 1), "the burst should run out");
@@ -493,7 +475,7 @@ mod tests {
         assert!(!l.take_at(t1, 1));
         // after a long time, at most the burst
         let t2 = t1 + Duration::from_secs(3600);
-        for _ in 0..CHALLENGE_BURST as usize {
+        for _ in 0..CHALLENGE_BURST {
             assert!(l.take_at(t2, 1));
         }
         assert!(!l.take_at(t2, 1));
@@ -503,7 +485,7 @@ mod tests {
     fn page_bucket_burst_and_refill() {
         let l = Limiter::new();
         let t0 = Instant::now();
-        for _ in 0..CIRCUIT_PAGE_BURST as usize {
+        for _ in 0..CIRCUIT_PAGE_BURST {
             assert!(l.take_page_at(t0, 1));
         }
         assert!(!l.take_page_at(t0, 1), "the page burst should run out");
@@ -519,12 +501,12 @@ mod tests {
     fn page_and_challenge_buckets_are_independent() {
         let l = Limiter::new();
         let t0 = Instant::now();
-        for _ in 0..CIRCUIT_PAGE_BURST as usize {
+        for _ in 0..CIRCUIT_PAGE_BURST {
             assert!(l.take_page_at(t0, 5));
         }
         assert!(!l.take_page_at(t0, 5));
         // pages exhausted, challenges untouched (the visitor can still re-verify)
-        for _ in 0..CHALLENGE_BURST as usize {
+        for _ in 0..CHALLENGE_BURST {
             assert!(l.take_at(t0, 5));
         }
         assert!(!l.take_at(t0, 5));

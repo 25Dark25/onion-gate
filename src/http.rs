@@ -22,8 +22,6 @@ use crate::limit::Reservation;
 use std::time::{Duration, Instant};
 
 const MAX_HEAD: usize = 16 * 1024;
-/// Default body cap (the `max_body` setting).
-pub const DEFAULT_MAX_BODY: usize = 1024 * 1024;
 const MAX_TARGET: usize = 2048;
 /// Deadline for the request line and headers (anti-slowloris).
 const READ_DEADLINE: Duration = Duration::from_secs(8);
@@ -291,12 +289,6 @@ impl PendingBody {
     }
 }
 
-/// Reads one HTTP request. `initial` holds bytes already read (whatever followed
-/// the PROXY line, or nothing). `max_body` caps the request body.
-pub fn read_request(stream: &mut TcpStream, initial: Vec<u8>, max_body: usize) -> Result<Request, HttpError> {
-    read_head(stream, initial)?.read_body(stream, max_body, None)
-}
-
 /// Reads and validates the request line and headers, but not the body.
 pub fn read_head(stream: &mut TcpStream, initial: Vec<u8>) -> Result<PendingBody, HttpError> {
     let deadline = Instant::now() + READ_DEADLINE;
@@ -505,7 +497,6 @@ pub fn reason(code: u16) -> &'static str {
         200 => "OK",
         303 => "See Other",
         400 => "Bad Request",
-        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         408 => "Request Timeout",
@@ -530,17 +521,9 @@ X-Frame-Options: DENY\r\n\
 Cross-Origin-Opener-Policy: same-origin\r\n\
 Content-Security-Policy: default-src 'none'; img-src data:; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'\r\n";
 
-pub fn send(stream: &mut TcpStream, r: &Reply) {
-    write_reply(stream, r, true);
-}
-
-/// The reply to a HEAD request: the same headers (Content-Length included, as
-/// for GET), no body.
-pub fn send_head(stream: &mut TcpStream, r: &Reply) {
-    write_reply(stream, r, false);
-}
-
-fn write_reply(stream: &mut TcpStream, r: &Reply, with_body: bool) {
+/// Sends one of the gate's own replies. For a HEAD request (`head_only`), the
+/// same headers (Content-Length included, as for GET) and no body.
+pub fn send(stream: &mut TcpStream, r: &Reply, head_only: bool) {
     let mut head = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}",
         r.status,
@@ -558,7 +541,7 @@ fn write_reply(stream: &mut TcpStream, r: &Reply, with_body: bool) {
     head.push_str("Connection: close\r\n\r\n");
 
     let mut out = head.into_bytes();
-    if with_body {
+    if !head_only {
         out.extend_from_slice(r.body.as_bytes());
     }
     send_raw(stream, &out);

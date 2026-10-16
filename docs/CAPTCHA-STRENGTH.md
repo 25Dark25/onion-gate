@@ -68,7 +68,7 @@ operator needs.
   defense is for.
 - **Making the images harder is a weak lever.** It costs real visitors as much
   as it costs solvers, and a generator whose code is public loses an arms race
-  against a model trained on its own output. A third round (`ROUNDS = 3`) would
+  against a model trained on its own output. A third round (`rounds = 3`) would
   cut this solver's pass rate to about 21 % at the price of one more click for
   everyone; how much it costs humans has not been measured yet.
 

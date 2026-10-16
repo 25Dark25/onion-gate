@@ -3,12 +3,12 @@
 //! Properties:
 //!  - A challenge token is consumed (DELETED) on the first verification
 //!    attempt, whether it succeeds or fails. No retries on the same token.
-//!  - Strict expiry (CHALLENGE_TTL + GRACE), checked on every use.
+//!  - Strict expiry (`challenge_ttl` + GRACE), checked on every use.
 //!  - Each challenge carries the path to return to once the CAPTCHA is passed.
 //!    It is the sanitized request path (see `safe_return_path` in lib.rs): always a
 //!    same-origin absolute path, so it can never become an open redirect. It is
 //!    stored here, bound to the token, never echoed through the client.
-//!  - A pass dies after PASS_IDLE without use or PASS_MAX after it was issued,
+//!  - A pass dies after `pass_idle` without use or `pass_max` after it was issued,
 //!    whichever comes first. Each pass has a request budget (token bucket);
 //!    spending it all REVOKES the pass.
 //!  - Bounded memory: once the maximum is reached, new entries are refused
@@ -24,25 +24,10 @@ use std::time::{Duration, Instant};
 
 pub type Token = [u8; 16];
 
-// Defaults of the configurable settings (config.rs takes its defaults from
-// here; the binary can override them).
-
-/// VISIBLE lifetime of a challenge: how long the page's progress bar lasts.
-pub const CHALLENGE_TTL: Duration = Duration::from_secs(30);
-/// Extra server-side margin for Tor latency (the bar starts when the browser
-/// finishes receiving the page, and the click takes time to arrive).
+/// Extra server-side margin on top of `challenge_ttl` for Tor latency (the
+/// page's bar starts when the browser has received it, and the click takes
+/// time to arrive).
 const GRACE: Duration = Duration::from_secs(5);
-/// A pass not used for this long expires (sliding: every page view renews it).
-pub const PASS_IDLE: Duration = Duration::from_secs(30 * 60);
-/// Hard lifetime of a pass, however active it is. Bounds how long a shared or
-/// stolen pass stays useful.
-pub const PASS_MAX: Duration = Duration::from_secs(2 * 60 * 60);
-/// Requests a pass may make in one burst. Every request counts, assets
-/// included: a page with ~20 assets, a few tabs at once...
-pub const PASS_BURST: f32 = 60.0;
-/// ...and the sustained rate: 1 per second (60 per minute), about three pages
-/// of ~20 requests each per minute. A scraper going faster is cut.
-pub const PASS_REFILL_PER_SEC: f32 = 1.0;
 
 const MAX_CHALLENGES: usize = 20_000;
 const MAX_PASSES: usize = 20_000;
@@ -346,6 +331,12 @@ fn nibble(c: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The default settings, for the tests.
+    const CHALLENGE_TTL: Duration = Duration::from_secs(30);
+    const PASS_IDLE: Duration = Duration::from_secs(30 * 60);
+    const PASS_MAX: Duration = Duration::from_secs(2 * 60 * 60);
+    const PASS_BURST: usize = 60;
     use crate::captcha::Warp;
 
     fn sec(cx: f32) -> Secret {
@@ -469,7 +460,7 @@ mod tests {
         let s = Store::new();
         let t0 = Instant::now();
         assert!(s.add_pass_at(t0, T1, false));
-        for _ in 0..PASS_BURST as usize {
+        for _ in 0..PASS_BURST {
             assert_eq!(s.use_pass_at(t0, &T1), PassUse::Ok);
         }
         assert_eq!(s.use_pass_at(t0, &T1), PassUse::Exhausted);

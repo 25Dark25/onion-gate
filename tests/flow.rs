@@ -4,10 +4,10 @@
 //! two-round CAPTCHA, pass cookie, forwarding, and the per-circuit limits.
 
 use onion_gate::config::Limits;
-use onion_gate::store::{from_hex, to_hex, Store, Token};
+use onion_gate::store::{from_hex, to_hex, Token};
 use onion_gate::upstream::Upstream;
-use onion_gate::limit::{Memory, Owner, MAX_BUFFERED_PER_CIRCUIT};
-use onion_gate::{captcha, limit::Limiter, metrics, serve_connection, App, COOKIE};
+use onion_gate::limit::Owner;
+use onion_gate::{captcha, metrics, serve_connection, App, COOKIE};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::sync::Arc;
@@ -65,58 +65,36 @@ fn backend(linger: bool) -> String {
     addr
 }
 
+/// A gate built the way the binary builds it (`App::new`), in front of
+/// `upstream`, with tor's PROXY line on.
+fn serve_gate(upstream: &str, limits: Limits) -> (u16, Arc<App>) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Arc::new(App::new(Upstream::new(upstream).unwrap(), true, limits));
+    let a = Arc::clone(&app);
+    thread::spawn(move || {
+        for s in listener.incoming().flatten() {
+            let a2 = Arc::clone(&a);
+            thread::spawn(move || {
+                let mut s = s;
+                serve_connection(&mut s, &a2);
+            });
+        }
+    });
+    (port, app)
+}
+
+/// The defaults, with a small body cap.
+fn small_body() -> Limits {
+    Limits { max_body: 64 * 1024, ..Limits::default() }
+}
+
 fn start() -> (u16, Arc<App>) {
-    start_with(false)
+    serve_gate(&backend(false), small_body())
 }
 
-fn start_with(linger: bool) -> (u16, Arc<App>) {
-    start_custom(linger, Memory::default())
-}
-
-fn start_custom(linger: bool, memory: Memory) -> (u16, Arc<App>) {
-    let backend = backend(linger);
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let app = Arc::new(App {
-        store: Store::new(),
-        limiter: Limiter::new(),
-        upstream: Upstream::new(&backend, COOKIE).unwrap(),
-        proxy: true,
-        memory,
-        limits: Limits { max_body: 64 * 1024, ..Limits::default() },
-        metrics: Default::default(),
-        adaptive: onion_gate::adaptive::Adaptive::new(&Limits::default()),
-    });
-    let a = Arc::clone(&app);
-    thread::spawn(move || {
-        for s in listener.incoming().flatten() {
-            let a2 = Arc::clone(&a);
-            thread::spawn(move || {
-                let mut s = s;
-                serve_connection(&mut s, &a2);
-            });
-        }
-    });
-    (port, app)
-}
-
-/// A gate built the way the binary builds it, from configured limits.
 fn start_limits(limits: Limits) -> (u16, Arc<App>) {
-    let backend = backend(false);
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let app = Arc::new(App::new(Upstream::new(&backend, COOKIE).unwrap(), true, limits));
-    let a = Arc::clone(&app);
-    thread::spawn(move || {
-        for s in listener.incoming().flatten() {
-            let a2 = Arc::clone(&a);
-            thread::spawn(move || {
-                let mut s = s;
-                serve_connection(&mut s, &a2);
-            });
-        }
-    });
-    (port, app)
+    serve_gate(&backend(false), limits)
 }
 
 /// Tor's PROXY v1 line encoding the circuit in a TCP4 source address.
@@ -313,7 +291,7 @@ fn a_single_wrong_round_restarts_without_a_pass() {
 fn challenge_permits_run_out_per_circuit() {
     let (port, _app) = start();
     let c = 0x1111_1111;
-    // CHALLENGE_BURST is 10; after that a challenge-generating request is 429.
+    // challenge_burst is 10; after that a challenge-generating request is 429.
     let mut got_429 = false;
     for _ in 0..40 {
         let r = send(port, c, "GET", "/", None, None);
@@ -358,7 +336,7 @@ fn post_body_reaches_the_backend_intact() {
 
 #[test]
 fn a_backend_that_keeps_the_connection_open_is_not_waited_on() {
-    let (port, app) = start_with(true);
+    let (port, app) = serve_gate(&backend(true), small_body());
     let c = 0x5555_5555;
     let pass = pass_for(port, app.as_ref(), c);
     let t0 = std::time::Instant::now();
@@ -372,28 +350,7 @@ fn a_backend_that_keeps_the_connection_open_is_not_waited_on() {
 fn an_unreachable_backend_is_a_502_not_a_hang() {
     // Bind and drop a listener to get a loopback port nobody listens on.
     let dead = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap().to_string();
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let app = Arc::new(App {
-        store: Store::new(),
-        limiter: Limiter::new(),
-        upstream: Upstream::new(&dead, COOKIE).unwrap(),
-        proxy: true,
-        memory: Memory::default(),
-        limits: Limits { max_body: 64 * 1024, ..Limits::default() },
-        metrics: Default::default(),
-        adaptive: onion_gate::adaptive::Adaptive::new(&Limits::default()),
-    });
-    let a = Arc::clone(&app);
-    thread::spawn(move || {
-        for s in listener.incoming().flatten() {
-            let a2 = Arc::clone(&a);
-            thread::spawn(move || {
-                let mut s = s;
-                serve_connection(&mut s, &a2);
-            });
-        }
-    });
+    let (port, app) = serve_gate(&dead, small_body());
     let c = 0x6666_6666;
     let pass = pass_for(port, app.as_ref(), c);
     let r = send(port, c, "GET", "/", Some(&pass), None);
@@ -442,7 +399,7 @@ fn a_large_body_with_a_valid_pass_is_forwarded() {
 fn a_spent_memory_budget_is_a_503_not_an_oom() {
     // A budget too small for any forwarded request: the gate itself (challenge,
     // verify) still works, and forwarding answers 503 instead of buffering.
-    let (port, app) = start_custom(false, Memory::new(100));
+    let (port, app) = start_limits(Limits { memory: 100, ..small_body() });
     let c = 0x3737_3737;
     let pass = pass_for(port, app.as_ref(), c);
     let get = send(port, c, "GET", "/", Some(&pass), None);
@@ -467,7 +424,7 @@ fn a_declared_body_that_never_arrives_reserves_nothing() {
     // Budget 4096. A pass holder declares a 1900-byte body and sends none of it:
     // were it reserved upfront (2 x 1900), the next forwarded request would not
     // fit and get a 503.
-    let (port, app) = start_custom(false, Memory::new(4096));
+    let (port, app) = start_limits(Limits { memory: 4096, ..small_body() });
     let c = 0x3939_3939;
     let pass = pass_for(port, app.as_ref(), c);
     let mut hanging = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
@@ -500,7 +457,7 @@ fn one_circuit_cannot_hold_more_than_its_share_of_the_budget() {
     let (c, other) = (0x4040_4040, 0x4141_4141);
     let pass = pass_for(port, app.as_ref(), c);
     // Stand in for slow readers on circuit `c` holding its whole share.
-    let held = app.memory.reserve_for(&[Owner::Circuit(c)], MAX_BUFFERED_PER_CIRCUIT).unwrap();
+    let held = app.memory.reserve_for(&[Owner::Circuit(c)], Limits::default().memory_per_circuit).unwrap();
     let r = send(port, c, "GET", "/a", Some(&pass), None);
     assert!(r.starts_with("HTTP/1.1 503") && !r.contains("BACKEND"), "{}", &r[..r.len().min(120)]);
     // the rest of the budget still serves other circuits, even with the same pass

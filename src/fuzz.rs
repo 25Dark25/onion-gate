@@ -75,7 +75,7 @@ pub fn request(data: &[u8]) {
         body: p.rest.clone(),
     };
     fwd.body.truncate(p.content_length.unwrap_or(0));
-    let wire = upstream::build_request(&fwd, COOKIE);
+    let wire = upstream::build_request(&fwd);
     let he = http::find_head_end(&wire).expect("forwarded request has no head end");
     let p2 = match http::parse_head(wire.clone(), he) {
         Ok(p2) => p2,

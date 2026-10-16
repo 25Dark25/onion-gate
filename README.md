@@ -21,6 +21,11 @@ loopback backend you point it at.
 > human solver farm. Read [Limitations](#limitations) before relying on it. Use
 > it as a speed bump and a rate-limiter, not as a wall.
 
+<p align="center">
+  <img src="docs/captcha.png" width="360" alt="The challenge page: the text 'Click the broken circle. (1/2)', a time bar, and a 300 by 300 image of thin white rings on a noisy black background, crossed by wavy lines; one ring has a gap.">
+</p>
+<p align="center"><em>The challenge page in a browser (round 1 of 2). One ring has a gap: click it. Every image is new.</em></p>
+
 ## What it is for
 
 A hidden service (or any site you can run a local backend for) gets hammered by
@@ -364,6 +369,7 @@ scripts/         harness.sh: automated checks against the real binaries, and a s
 docs/TESTING.md  how to test: cargo test, the harness, and the Tor Browser (Safest) checklist
 docs/CAPTCHA-STRENGTH.md  the CAPTCHA measured against a reference solver
 docs/RELEASING.md  how a release is built, signed and published
+docs/captcha.png  a screenshot of the challenge page (for this README)
 deploy/          example configuration, torrc and a hardened systemd unit
 .github/         CI (tests on Linux and macOS, MSRV and stable) and Dependabot
 ```

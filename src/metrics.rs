@@ -38,8 +38,9 @@ impl Counter {
 }
 
 /// Every counter the gate keeps.
+#[derive(Default)]
 pub struct Metrics {
-    started: Instant,
+    started: Started,
     /// Connections accepted, refused for `max_conn`, and open right now.
     pub conn_accepted: Counter,
     pub conn_refused: Counter,
@@ -81,35 +82,12 @@ pub struct Metrics {
     pub mode_changes: Counter,
 }
 
-impl Default for Metrics {
+/// When the gate started (for the uptime).
+pub struct Started(Instant);
+
+impl Default for Started {
     fn default() -> Self {
-        Metrics {
-            started: Instant::now(),
-            conn_accepted: Counter::default(),
-            conn_refused: Counter::default(),
-            conn_open: Counter::default(),
-            proxy_rejected: Counter::default(),
-            bad_requests: Counter::default(),
-            limited_connections: Counter::default(),
-            limited_challenges: Counter::default(),
-            challenges: Counter::default(),
-            verify_failed: Counter::default(),
-            verify_next_round: Counter::default(),
-            verify_passed: Counter::default(),
-            revoked_pass_budget: Counter::default(),
-            revoked_circuit_budget: Counter::default(),
-            store_full: Counter::default(),
-            memory_busy: Counter::default(),
-            forwarded: Counter::default(),
-            upstream_connect: Counter::default(),
-            upstream_timeout: Counter::default(),
-            upstream_bad_response: Counter::default(),
-            upstream_too_large: Counter::default(),
-            upstream_micros: Counter::default(),
-            arrivals: Counter::default(),
-            free_passes: Counter::default(),
-            mode_changes: Counter::default(),
-        }
+        Started(Instant::now())
     }
 }
 
@@ -130,7 +108,7 @@ pub fn render(app: &App) -> String {
         &format!("{{version=\"{}\"}}", env!("CARGO_PKG_VERSION")),
         1,
     )]);
-    family(&mut o, "uptime_seconds", "gauge", "Seconds since the gate started.", &[("", m.started.elapsed().as_secs())]);
+    family(&mut o, "uptime_seconds", "gauge", "Seconds since the gate started.", &[("", m.started.0.elapsed().as_secs())]);
     family(&mut o, "connections_total", "counter", "Connections accepted, or refused because max_conn were open.", &[
         ("{result=\"accepted\"}", m.conn_accepted.get()),
         ("{result=\"refused_max_conn\"}", m.conn_refused.get()),

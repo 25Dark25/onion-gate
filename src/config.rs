@@ -58,29 +58,45 @@ pub struct Limits {
 }
 
 impl Default for Limits {
-    /// The documented defaults, taken from the constants in each module.
+    /// The documented defaults, and why they are what they are.
     fn default() -> Limits {
-        use crate::{http, limit, store, upstream};
-        let per_minute = |per_sec: f32| (per_sec * 60.0).round() as u32;
         Limits {
-            rounds: crate::ROUNDS,
-            challenge_ttl: store::CHALLENGE_TTL,
-            pass_idle: store::PASS_IDLE,
-            pass_max: store::PASS_MAX,
-            pass_burst: store::PASS_BURST as u32,
-            pass_per_minute: per_minute(store::PASS_REFILL_PER_SEC),
-            circuit_burst: limit::CIRCUIT_PAGE_BURST as u32,
-            circuit_per_minute: per_minute(limit::CIRCUIT_PAGE_REFILL_PER_SEC),
-            challenge_burst: limit::CHALLENGE_BURST as u32,
-            challenge_per_minute: per_minute(limit::CHALLENGE_REFILL_PER_SEC),
-            conn_per_circuit: limit::MAX_CONN_PER_CIRCUIT,
-            max_conn: DEFAULT_MAX_CONN,
-            max_body: http::DEFAULT_MAX_BODY,
-            max_response: upstream::MAX_RESPONSE,
-            upstream_timeout: upstream::IO_TIMEOUT,
-            memory: limit::MAX_BUFFERED,
-            memory_per_circuit: limit::MAX_BUFFERED_PER_CIRCUIT,
-            memory_per_pass: limit::MAX_BUFFERED_PER_PASS,
+            rounds: 2,
+            // The page's time bar; the store adds 5 s of grace for Tor latency.
+            challenge_ttl: Duration::from_secs(30),
+            // Sliding (every request renews it), and a hard cap that bounds how
+            // long a shared or stolen pass stays useful.
+            pass_idle: Duration::from_secs(30 * 60),
+            pass_max: Duration::from_secs(2 * 60 * 60),
+            // Every request counts, assets included: a page with ~20 assets and
+            // a few tabs at once fit the burst; 60 a minute is about three such
+            // pages a minute. A scraper going faster is cut.
+            pass_burst: 60,
+            pass_per_minute: 60,
+            // Looser than the pass budget, so an honest visitor never hits this
+            // one first; it catches several passes used from one circuit.
+            circuit_burst: 90,
+            circuit_per_minute: 90,
+            // Every image costs CPU: 10 in a burst, then 1 every 6 s.
+            challenge_burst: 10,
+            challenge_per_minute: 10,
+            // No keep-alive: every request of a page is its own connection, and
+            // browsers open about 6 in parallel per host. 8 leaves margin while
+            // bounding how many slow connections one circuit holds (slowloris).
+            conn_per_circuit: 8,
+            // One thread per connection.
+            max_conn: 512,
+            max_body: 1024 * 1024,
+            max_response: 8 * 1024 * 1024,
+            upstream_timeout: Duration::from_secs(30),
+            // Everything is buffered in memory (no streaming): a global bound
+            // turns "out of memory" into a 503. One circuit's share fits one
+            // maximal response (8 MiB, counted twice while re-framed) next to a
+            // page's assets; filling the whole budget takes at least
+            // memory / memory_per_pass passes, each a solved CAPTCHA.
+            memory: 128 * 1024 * 1024,
+            memory_per_circuit: 24 * 1024 * 1024,
+            memory_per_pass: 32 * 1024 * 1024,
             adaptive: false,
             adaptive_new_per_minute: 60,
             adaptive_hold: Duration::from_secs(15 * 60),
@@ -88,9 +104,6 @@ impl Default for Limits {
         }
     }
 }
-
-/// Simultaneous connections in total (one thread each); extra ones are closed.
-pub const DEFAULT_MAX_CONN: usize = 512;
 
 impl Limits {
     pub fn pass_per_sec(&self) -> f32 {
@@ -233,8 +246,9 @@ pub const KEYS: &[(&str, &str)] = &[
     ("adaptive_force_file", "Adaptive: while this file exists the gate stays under attack (touch it to force the CAPTCHA). Empty: none."),
 ];
 
-impl Config {
-    fn empty() -> Config {
+impl Default for Config {
+    /// Every setting at its default (upstream empty: it has none).
+    fn default() -> Config {
         Config {
             port: 8088,
             upstream: String::new(),
@@ -243,7 +257,9 @@ impl Config {
             limits: Limits::default(),
         }
     }
+}
 
+impl Config {
     /// Sets one key from its text value.
     pub fn set(&mut self, key: &str, value: &str) -> Result<(), String> {
         let key = key.trim().to_ascii_lowercase().replace('-', "_");
@@ -299,7 +315,7 @@ impl Config {
     }
 
     /// The value of one key, written the way the file takes it.
-    fn get(&self, key: &str) -> String {
+    pub fn get(&self, key: &str) -> String {
         let l = &self.limits;
         match key {
             "port" => self.port.to_string(),
@@ -402,7 +418,7 @@ where
     F: Fn(&str) -> Result<String, String>,
 {
     let args: Vec<String> = args.into_iter().collect();
-    let mut cfg = Config::empty();
+    let mut cfg = Config::default();
     let mut mode = 0u8; // 0 run, 1 print, 2 check
 
     // The file first, so that flags override it wherever they appear.
@@ -659,7 +675,7 @@ mod tests {
         for (key, _) in KEYS {
             assert!(text.contains(&format!("\n{} =", key)), "{} missing", key);
         }
-        let mut back = Config::empty();
+        let mut back = Config::default();
         back.apply_file("printed", &text).unwrap();
         assert_eq!(back, c);
         // and an empty upstream prints as a usable example
@@ -669,7 +685,7 @@ mod tests {
 
     #[test]
     fn the_example_file_is_valid_and_matches_the_defaults() {
-        let mut c = Config::empty();
+        let mut c = Config::default();
         c.apply_file("deploy/onion-gate.conf", include_str!("../deploy/onion-gate.conf")).unwrap();
         assert!(c.problems().is_empty(), "{:?}", c.problems());
         assert_eq!(c.limits, Limits::default(), "regenerate it with --print-config");
@@ -690,7 +706,7 @@ mod tests {
 
     #[test]
     fn every_key_can_be_set_and_read() {
-        let mut c = Config::empty();
+        let mut c = Config::default();
         for (key, _) in KEYS {
             let v = c.get(key);
             let v = if v.is_empty() { "127.0.0.1:1".to_string() } else { v };

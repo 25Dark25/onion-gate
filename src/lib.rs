@@ -44,9 +44,6 @@ use std::net::TcpStream;
 use store::{PassUse, Store, Token};
 use upstream::Upstream;
 
-/// Consecutive CAPTCHA rounds required by default (`rounds` in the
-/// configuration). A failure restarts the chain.
-pub const ROUNDS: u8 = 2;
 /// Name of the session pass cookie.
 pub const COOKIE: &str = "onion_gate_pass";
 /// The gate's own reserved namespace. Requests here are the gate itself and are
@@ -186,7 +183,7 @@ pub fn serve_connection(stream: &mut TcpStream, app: &App) {
             Some(slot) => Some(slot),
             None => {
                 app.metrics.limited_connections.inc();
-                http::send(stream, &too_many());
+                http::send(stream, &too_many(), false);
                 http::close(stream);
                 return;
             }
@@ -213,8 +210,7 @@ pub fn serve_connection(stream: &mut TcpStream, app: &App) {
     });
     match req {
         Ok(req) => match route(&req, circuit, app) {
-            Out::Reply(r) if head_request => http::send_head(stream, &r),
-            Out::Reply(r) => http::send(stream, &r),
+            Out::Reply(r) => http::send(stream, &r, head_request),
             // A relayed HEAD response is already body-less (upstream.rs).
             Out::Raw(bytes, _held) => http::send_raw(stream, &bytes),
         },
@@ -224,10 +220,8 @@ pub fn serve_connection(stream: &mut TcpStream, app: &App) {
                 Some(_) => app.metrics.bad_requests.inc(),
                 None => {}
             }
-            match error_reply(&e) {
-                Some(reply) if head_request => http::send_head(stream, &reply),
-                Some(reply) => http::send(stream, &reply),
-                None => {}
+            if let Some(reply) = error_reply(&e) {
+                http::send(stream, &reply, head_request);
             }
         }
     }
@@ -241,7 +235,7 @@ fn error_reply(e: &HttpError) -> Option<Reply> {
     }
     let mut r = Reply::page(status, html::message(&format!("Error {}", status)));
     if status == 405 {
-        r.extra.push(("Allow", "GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS".to_string()));
+        r.extra.push(("Allow", http::METHODS.join(", ")));
     }
     Some(r)
 }

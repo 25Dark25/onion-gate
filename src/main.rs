@@ -6,7 +6,7 @@
 
 use onion_gate::config::{self, Action, Config, KEYS};
 use onion_gate::upstream::Upstream;
-use onion_gate::{adaptive, metrics, serve_connection, App, COOKIE};
+use onion_gate::{adaptive, metrics, serve_connection, App};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
@@ -39,7 +39,7 @@ fn validate(cfg: &Config) -> Result<Upstream, Vec<String>> {
     let mut problems = cfg.problems();
     let mut upstream = None;
     if !cfg.upstream.is_empty() {
-        match Upstream::new(&cfg.upstream, COOKIE) {
+        match Upstream::new(&cfg.upstream) {
             Ok(u) if cfg.metrics_port != 0 && points_at_self(u.addrs(), cfg.metrics_port) => problems.push(format!(
                 "upstream {} is onion-gate's metrics port; point it at the backend",
                 cfg.upstream
@@ -68,20 +68,9 @@ fn fail(problems: &[String]) -> ! {
 
 fn help() {
     println!("{}\n\nSettings (file key, or --key=value; - and _ are the same):", USAGE);
-    let defaults = Config {
-        port: 8088,
-        upstream: String::new(),
-        proxy_protocol: false,
-        metrics_port: 0,
-        limits: Default::default(),
-    }
-    .to_file();
+    let defaults = Config::default();
     for (key, text) in KEYS {
-        let default = defaults
-            .lines()
-            .find_map(|l| l.strip_prefix(&format!("{} = ", key)))
-            .unwrap_or("");
-        let default = if *key == "upstream" { "(required)" } else { default };
+        let default = if *key == "upstream" { "(required)".to_string() } else { defaults.get(key) };
         println!("  {:<22}{:<12}{}", key, default, text);
     }
 }

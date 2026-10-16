@@ -14,7 +14,7 @@
 //!  - The upstream must be a loopback address (checked at startup): the gate is
 //!    meant to sit in front of a backend on the same host.
 //!  - The whole request and response bodies are buffered in memory, each capped
-//!    (`max_body` and `MAX_RESPONSE`). This rules out streaming and very large
+//!    (`max_body` and `max_response`). This rules out streaming and very large
 //!    transfers by design; see the README.
 //!  - A chunked upstream response is de-chunked; otherwise `Content-Length` or
 //!    read-to-EOF frames the body.
@@ -25,10 +25,6 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
-/// Largest upstream response the gate will buffer and relay.
-/// Defaults of the configurable response cap and I/O timeout (config.rs).
-pub const MAX_RESPONSE: usize = 8 * 1024 * 1024;
-pub const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Header names that belong to a single hop and must never be forwarded in
@@ -53,9 +49,9 @@ pub enum ProxyError {
     Timeout,
     /// The upstream sent something that is not a usable HTTP/1 response.
     BadResponse,
-    /// The upstream response exceeded `MAX_RESPONSE`.
+    /// The upstream response exceeded `max_response`.
     TooLarge,
-    /// The global buffer budget (`limit::MAX_BUFFERED`) is spent.
+    /// The memory budget (the `memory` setting) is spent.
     Busy,
 }
 
@@ -74,8 +70,6 @@ impl ProxyError {
 pub struct Upstream {
     /// Every address `--upstream` resolved to (all loopback), tried in order.
     addrs: Vec<SocketAddr>,
-    /// The pass cookie name to strip from forwarded requests.
-    pass_cookie: &'static str,
     /// Largest response relayed, and the time the backend has to answer.
     max_response: usize,
     timeout: Duration,
@@ -84,7 +78,7 @@ pub struct Upstream {
 impl Upstream {
     /// Resolves `spec` (host:port) and requires every resolved address to be
     /// loopback. Returns an error string for the operator at startup.
-    pub fn new(spec: &str, pass_cookie: &'static str) -> Result<Upstream, String> {
+    pub fn new(spec: &str) -> Result<Upstream, String> {
         let addrs: Vec<SocketAddr> = spec.to_socket_addrs().map_err(|e| format!("{}: {}", spec, e))?.collect();
         if addrs.is_empty() {
             return Err(format!("{}: resolved to no address", spec));
@@ -95,16 +89,16 @@ impl Upstream {
                 spec, a
             ));
         }
+        let d = crate::config::Limits::default();
         Ok(Upstream {
             addrs,
-            pass_cookie,
-            max_response: MAX_RESPONSE,
-            timeout: IO_TIMEOUT,
+            max_response: d.max_response,
+            timeout: d.upstream_timeout,
         })
     }
 
-    /// Sets the response cap and the backend timeout (defaults: MAX_RESPONSE,
-    /// IO_TIMEOUT).
+    /// Sets the response cap and the backend timeout (default: the settings'
+    /// defaults).
     pub fn with_limits(mut self, max_response: usize, timeout: Duration) -> Upstream {
         self.max_response = max_response;
         self.timeout = timeout;
@@ -127,7 +121,7 @@ impl Upstream {
         owners: &[Owner],
     ) -> Result<(Vec<u8>, Reservation<'m>), ProxyError> {
         let mut held = mem.reserve_for(owners, 0).ok_or(ProxyError::Busy)?;
-        let wire = build_request(req, self.pass_cookie);
+        let wire = build_request(req);
         // `localhost` may resolve to ::1 and 127.0.0.1; use the first that answers.
         let mut stream = self
             .addrs
@@ -389,7 +383,7 @@ fn dropped_request_header(lname: &str) -> bool {
 }
 
 /// Builds the request line + headers + body to send to the upstream.
-pub(crate) fn build_request(req: &Request, pass_cookie: &str) -> Vec<u8> {
+pub(crate) fn build_request(req: &Request) -> Vec<u8> {
     // Headers named in the client's `Connection` header are hop-by-hop too.
     let named: Vec<String> = req
         .headers
@@ -409,7 +403,7 @@ pub(crate) fn build_request(req: &Request, pass_cookie: &str) -> Vec<u8> {
         }
         if lname == "cookie" {
             // Only the pass cookie present -> drop the header entirely.
-            if let Some(v) = http::cookie_without(value, pass_cookie) {
+            if let Some(v) = http::cookie_without(value, crate::COOKIE) {
                 head.push_str("Cookie: ");
                 head.push_str(&v);
                 head.push_str("\r\n");
@@ -610,10 +604,10 @@ mod tests {
 
     #[test]
     fn non_loopback_upstream_is_refused() {
-        assert!(Upstream::new("127.0.0.1:8080", "pass").is_ok());
-        assert!(Upstream::new("localhost:8080", "pass").is_ok());
-        assert!(Upstream::new("8.8.8.8:80", "pass").is_err());
-        assert!(Upstream::new("not a host:port", "pass").is_err());
+        assert!(Upstream::new("127.0.0.1:8080").is_ok());
+        assert!(Upstream::new("localhost:8080").is_ok());
+        assert!(Upstream::new("8.8.8.8:80").is_err());
+        assert!(Upstream::new("not a host:port").is_err());
     }
 
     #[test]
@@ -628,7 +622,7 @@ mod tests {
             ],
             b"",
         );
-        let wire = String::from_utf8(build_request(&r, "onion_gate_pass")).unwrap();
+        let wire = String::from_utf8(build_request(&r)).unwrap();
         assert!(wire.starts_with("GET /p?q=1 HTTP/1.1\r\n"));
         assert!(wire.contains("Host: site.onion\r\n"));
         assert!(wire.contains("Accept: text/html\r\n"));
@@ -643,14 +637,14 @@ mod tests {
     #[test]
     fn request_drops_cookie_header_when_only_pass() {
         let r = req("GET", vec![("Cookie", "onion_gate_pass=secret")], b"");
-        let wire = String::from_utf8(build_request(&r, "onion_gate_pass")).unwrap();
+        let wire = String::from_utf8(build_request(&r)).unwrap();
         assert!(!wire.to_lowercase().contains("cookie:"), "no cookie header should remain");
     }
 
     #[test]
     fn request_sets_content_length_for_a_body() {
         let r = req("POST", vec![("Host", "x")], b"hello");
-        let wire = String::from_utf8(build_request(&r, "p")).unwrap();
+        let wire = String::from_utf8(build_request(&r)).unwrap();
         assert!(wire.contains("Content-Length: 5\r\n"));
         assert!(wire.ends_with("\r\n\r\nhello"));
     }
@@ -658,7 +652,7 @@ mod tests {
     #[test]
     fn request_without_host_gets_one() {
         let r = req("GET", vec![("Accept", "*/*")], b"");
-        let wire = String::from_utf8(build_request(&r, "p")).unwrap();
+        let wire = String::from_utf8(build_request(&r)).unwrap();
         assert!(wire.contains("Host: localhost\r\n"));
     }
 
@@ -812,7 +806,7 @@ mod tests {
         let out = String::from_utf8(frame_response(raw, false).unwrap()).unwrap();
         assert!(!out.contains("X-Hop") && out.contains("X-Keep: 2\r\n"));
         let r = req("GET", vec![("Connection", "X-Secret"), ("X-Secret", "1"), ("Host", "h")], b"");
-        let wire = String::from_utf8(build_request(&r, "p")).unwrap();
+        let wire = String::from_utf8(build_request(&r)).unwrap();
         assert!(!wire.contains("X-Secret"));
     }
 
@@ -835,23 +829,23 @@ mod tests {
             ],
             b"",
         );
-        let wire = String::from_utf8(build_request(&r, "p")).unwrap();
+        let wire = String::from_utf8(build_request(&r)).unwrap();
         assert!(!wire.contains("10.0.0.") && !wire.contains("evil") && !wire.contains("https"), "{}", wire);
         assert!(wire.contains("X-Other: kept\r\n"));
     }
 
     #[test]
     fn an_empty_post_still_says_content_length_0() {
-        let wire = String::from_utf8(build_request(&req("POST", vec![("Host", "h")], b""), "p")).unwrap();
+        let wire = String::from_utf8(build_request(&req("POST", vec![("Host", "h")], b""))).unwrap();
         assert!(wire.contains("Content-Length: 0\r\n"), "{}", wire);
-        let wire = String::from_utf8(build_request(&req("GET", vec![("Host", "h")], b""), "p")).unwrap();
+        let wire = String::from_utf8(build_request(&req("GET", vec![("Host", "h")], b""))).unwrap();
         assert!(!wire.contains("Content-Length"), "{}", wire);
     }
 
     #[test]
     fn expect_is_not_forwarded() {
         let r = req("POST", vec![("Host", "h"), ("Expect", "100-continue")], b"abc");
-        let wire = String::from_utf8(build_request(&r, "p")).unwrap();
+        let wire = String::from_utf8(build_request(&r)).unwrap();
         assert!(!wire.to_lowercase().contains("expect"));
     }
 
@@ -872,7 +866,7 @@ mod tests {
                 std::thread::sleep(Duration::from_secs(20));
             }
         });
-        Upstream::new(&addr, "p").unwrap()
+        Upstream::new(&addr).unwrap()
     }
 
     fn get() -> Request {
@@ -917,7 +911,7 @@ mod tests {
                 while matches!(s.read(&mut buf), Ok(n) if n > 0) {}
             }
         });
-        let up = Upstream::new(&addr, "p").unwrap();
+        let up = Upstream::new(&addr).unwrap();
         let big = req("POST", vec![("Host", "h")], &vec![b'x'; 1024 * 1024]);
         let mem = Memory::default();
         let (bytes, _held) = up.forward(&big, &mem, &[]).expect("the 413 is relayed");
@@ -941,7 +935,7 @@ mod tests {
                 let _ = s.write_all(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n");
             }
         });
-        let up = Upstream::new(&addr, "p").unwrap();
+        let up = Upstream::new(&addr).unwrap();
         let big = req("POST", vec![("Host", "h")], &vec![b'x'; 8 * 1024 * 1024]);
         let mem = Memory::default();
         let (bytes, _held) = up.forward(&big, &mem, &[]).expect("the 413 is relayed, not a 502");

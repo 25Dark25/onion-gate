@@ -157,8 +157,12 @@ fn click_body(app: &App, tok: &Token) -> String {
 
 /// Solves every round starting from a challenge page, returns the final reply.
 fn solve(port: u16, app: &App, circuit: u32, first: &str) -> String {
+    // As many rounds as the gate asks for (one more under attack), at most 5.
     let mut resp = first.to_string();
-    for i in 0..app.limits.rounds {
+    for i in 0..5 {
+        if i > 0 && !is_challenge(&resp) {
+            break;
+        }
         assert!(is_challenge(&resp), "round {}: expected a challenge, got:\n{}", i + 1, &resp[..resp.len().min(200)]);
         let body = click_body(app, &token_of(&resp));
         resp = send(port, circuit, "POST", "/__gate/verify", None, Some(&body));
@@ -477,6 +481,7 @@ fn configured_rounds_and_challenge_lifetime_are_used() {
         assert!(first.contains("animation:d 45s"), "the time bar follows challenge_ttl");
         let done = solve(port, &app, 0x0B00_0000 + rounds as u32, &first);
         assert!(done.starts_with("HTTP/1.1 303"), "{} rounds then a pass:\n{}", rounds, &done[..done.len().min(300)]);
+        assert_eq!(metrics_sample(&app, "onion_gate_verifications_total{result=\"next_round\"}"), rounds as u64 - 1, "exactly {} rounds", rounds);
     }
 }
 
@@ -688,4 +693,35 @@ fn adaptive_calm_still_gives_a_subresource_a_free_pass() {
 
 fn metrics_sample(app: &App, name: &str) -> u64 {
     sample(&metrics::render(app), name)
+}
+
+#[test]
+fn under_attack_a_pass_needs_one_more_round() {
+    use onion_gate::adaptive::{step, Change};
+    let flag = std::env::temp_dir().join(format!("onion-gate-test-rounds-{}", std::process::id()));
+    std::fs::write(&flag, b"").unwrap();
+    let (port, app) = start_limits(Limits { adaptive_force_file: flag.to_str().unwrap().to_string(), ..adaptive_limits() });
+    assert!(matches!(step(&app, std::time::Instant::now()), Some(Change::Attack(_))));
+    let c = 0x0F0F_0001;
+    let first = send(port, c, "GET", "/", None, None);
+    assert!(first.contains("(1/3)"), "rounds = 2, plus one under attack");
+    let done = solve(port, &app, c, &first);
+    assert!(done.starts_with("HTTP/1.1 303"));
+    assert_eq!(metrics_sample(&app, "onion_gate_verifications_total{result=\"next_round\"}"), 2, "three rounds");
+    std::fs::remove_file(&flag).unwrap();
+}
+
+#[test]
+fn a_wrong_answer_costs_an_extra_challenge_permit() {
+    let (port, _app) = start_limits(Limits { challenge_burst: 4, ..Limits::default() });
+    let c = 0x0F0F_0002;
+    let mut page = send(port, c, "GET", "/", None, None); // permit 1
+    for _ in 0..2 {
+        // (0, 0) is in the frame: always wrong. Each costs the verification's permit and one more.
+        let body = format!("t={}&c.x=0&c.y=0", to_hex(&token_of(&page)));
+        page = send(port, c, "POST", "/__gate/verify", None, Some(&body));
+        assert!(page.contains("Wrong or expired"));
+    }
+    // 1 + 2 x 2 > 4: the circuit is out of permits (it would have one left without the extra cost).
+    assert!(send(port, c, "GET", "/__gate/", None, None).starts_with("HTTP/1.1 429"));
 }

@@ -40,6 +40,8 @@ everything. CI runs it on Linux.
   backend in it;
 - security headers on the challenge (`Cache-Control: no-store`, the CSP,
   `Connection: close`) and no `<script>`;
+- a sub-resource request without a pass (`Sec-Fetch-Dest: style`) gets a
+  bare `403`, not the challenge;
 - `HEAD` gets headers and no body;
 - the `/__gate/` namespace: `404` for unknown paths, `405` with `Allow: POST`
   for `GET /__gate/verify`;
@@ -236,8 +238,9 @@ failure is worth a report with what you saw.
 | 18 | Open `/` in 10 tabs at once | Note what happens: some requests may get the "Too many requests from your connection" page (8 connections per circuit) |
 | 19 | Fail the CAPTCHA quickly, over and over | After about 10 images in a minute: "Too many requests from your connection. Wait a minute." (10 challenge images per circuit in a burst, 1 more every 6 s) |
 | 20 | Try the page on a narrow window (letterboxing) and with the dark/light theme | Text is readable; the image fits and keeps its 300×300 size |
+| 21 | With a pass, open the developer tools (Network), reload `/` | The image and stylesheet requests carry `Sec-Fetch-Dest: image` / `style` (how the gate tells a sub-resource from a page). If they do not, note it: the gate then relies on `Accept` |
 
-Items 1, 3, 12, 13 and 20 are about what only a real browser shows (image
+Items 1, 3, 12, 13, 20 and 21 are about what only a real browser shows (image
 rendering, click coordinates, layout); the rest are also covered by the
 automated tests and are here to confirm that tor and Tor Browser do not change
 the behavior.

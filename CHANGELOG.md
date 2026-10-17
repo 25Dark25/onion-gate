@@ -12,6 +12,11 @@ All notable changes to this project are listed here. Versions follow
   no challenge permit is spent. Detected by `Sec-Fetch-Dest`, or an `Accept`
   that leads with a non-HTML type; in doubt, the challenge as before. New
   metric `onion_gate_subresources_refused_total`.
+- A wrong or expired CAPTCHA answer costs the circuit one more challenge
+  permit: a solver that fails 41 % of rounds now needs about 7.4 permits per
+  pass instead of 5.6 (one pass every ~45 s per circuit instead of ~33 s).
+- In adaptive mode, while under attack, a pass needs one more round than
+  `rounds` (at most 5).
 
 ## [0.1.0] - 2026-10-16
 

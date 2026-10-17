@@ -58,11 +58,17 @@ operator needs.
 - **What the CAPTCHA still does:** it stops anything that does not target this
   gate specifically (generic scrapers, crawlers, scripts that only follow
   links), and it makes every pass cost an attacker some engineering and CPU.
-- **What actually limits a solver-equipped bot is the budgets.** One pass
-  costs it about 5–6 challenge images on average (`(1 + p) / p²` verifications
-  plus the first image). A circuit gets 10 images in a burst and one more every
-  6 s, so it can obtain about one pass every 35 s, and one pass is worth up to
-  1 request per second for up to 2 hours. A single circuit is therefore held to
+- **What actually limits a solver-equipped bot is the budgets.** With
+  `p` = 0.59 per round, one pass takes about 5.6 challenge images on average
+  (`(1 + p) / p²` verifications plus the first image), and every wrong answer
+  costs one more challenge permit, so about 7.4 permits per pass. A circuit
+  gets 10 permits in a burst and one more every 6 s, so it can obtain about
+  one pass every 45 s, and one pass is worth up to 1 request per second for up
+  to 2 hours.
+- **Under attack (adaptive mode), one more round.** With 3 rounds a pass
+  takes about 10.4 images and 14.3 permits, one every 86 s per circuit. People
+  pay one more click, only while the gate is under attack, and rarely pay the
+  failure cost. A single circuit is therefore held to
   its page budget (90 in a burst, 1.5 per second) whatever its CAPTCHA skill.
   More circuits mean more of everything: that is what tor's proof-of-work
   defense is for.

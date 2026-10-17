@@ -231,8 +231,9 @@ the CAPTCHA when the gate looks attacked:
   CAPTCHA, never a new free pass. Free passes may fill at most half the pass
   store.
 - **Under attack:** every free pass is revoked at once, and everyone without a
-  solved pass gets the CAPTCHA, exactly as with `captcha = always`. Solved
-  passes are never revoked by a mode change.
+  solved pass gets the CAPTCHA, with **one more round** than `rounds` (at most
+  5): about twice the images per pass for a solver, one more click for people,
+  only while it lasts. Solved passes are never revoked by a mode change.
 
 Every 5 seconds the gate looks at the last minute. It goes under attack when
 any of these holds: more than `adaptive_new_per_minute` arrivals (requests for

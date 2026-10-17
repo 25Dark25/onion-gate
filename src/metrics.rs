@@ -78,6 +78,8 @@ pub struct Metrics {
     pub arrivals: Counter,
     /// Passes issued without a CAPTCHA (adaptive mode, while calm).
     pub free_passes: Counter,
+    /// Sub-resource requests without a pass, refused with a bare 403.
+    pub subresources_refused: Counter,
     /// Adaptive mode changes (calm <-> under attack).
     pub mode_changes: Counter,
 }
@@ -122,6 +124,7 @@ pub fn render(app: &App) -> String {
     ]);
     family(&mut o, "arrivals_total", "counter", "Requests for the site without a valid pass.", &[("", m.arrivals.get())]);
     family(&mut o, "challenges_total", "counter", "Challenge images generated.", &[("", m.challenges.get())]);
+    family(&mut o, "subresources_refused_total", "counter", "Sub-resource requests (images, styles...) without a pass: a bare 403, no image.", &[("", m.subresources_refused.get())]);
     family(&mut o, "free_passes_total", "counter", "Passes issued without a CAPTCHA (adaptive mode, while calm).", &[("", m.free_passes.get())]);
     let mode = if !app.adaptive.enabled() { 2 } else if app.adaptive.calm() { 0 } else { 1 };
     family(&mut o, "mode", "gauge", "0 = adaptive and calm (free passes), 1 = adaptive and under attack, 2 = captcha always.", &[("", mode)]);

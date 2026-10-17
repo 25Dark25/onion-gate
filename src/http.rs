@@ -497,6 +497,7 @@ pub fn reason(code: u16) -> &'static str {
         200 => "OK",
         303 => "See Other",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         408 => "Request Timeout",

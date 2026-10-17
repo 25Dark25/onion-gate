@@ -275,6 +275,7 @@ curl -s http://127.0.0.1:9180/metrics | grep -v '^#'
 | Metric | What it counts |
 | --- | --- |
 | `onion_gate_challenges_total` | Challenge images generated |
+| `onion_gate_subresources_refused_total` | Images, styles... requested without a pass: a bare 403, no image drawn |
 | `onion_gate_arrivals_total` | Requests for the site without a valid pass (new visitors, expired passes, bots) |
 | `onion_gate_free_passes_total` | Passes issued without a CAPTCHA (adaptive, calm) |
 | `onion_gate_mode`, `onion_gate_mode_changes_total` | 0 = adaptive and calm, 1 = adaptive and under attack, 2 = `captcha = always`; changes |
@@ -435,9 +436,11 @@ Be honest with yourself about what this is:
   than plain `chunked`, conflicting `Content-Length`s, a header name that is not
   a token, or control bytes or non-UTF-8 bytes in the status line or a header is
   answered with `502` rather than relayed.
-- **A sub-request without a pass gets the challenge page.** If a pass expires
-  while a page is loading, an image or stylesheet request receives HTML instead
-  and shows as broken until the next navigation, which shows the CAPTCHA.
+- **A sub-request without a pass gets a bare `403`.** If a pass expires while
+  a page is loading, its images and stylesheets show as broken until the next
+  navigation, which shows the CAPTCHA. The gate tells them apart by
+  `Sec-Fetch-Dest`, or by an `Accept` that leads with a non-HTML type; a
+  request that says neither gets the challenge page, as a navigation would.
 - **Without a valid pass, a request body over 1 KiB is never read** (so nobody
   can make the gate buffer uploads before passing the CAPTCHA). If a pass
   expires while the visitor is uploading a large form, the browser may show a

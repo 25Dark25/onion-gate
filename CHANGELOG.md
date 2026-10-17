@@ -5,6 +5,14 @@ All notable changes to this project are listed here. Versions follow
 
 ## Unreleased
 
+### Changed
+
+- A request for a sub-resource (an image, a stylesheet...) without a valid
+  pass gets a bare `403` instead of the challenge page: no image is drawn and
+  no challenge permit is spent. Detected by `Sec-Fetch-Dest`, or an `Accept`
+  that leads with a non-HTML type; in doubt, the challenge as before. New
+  metric `onion_gate_subresources_refused_total`.
+
 ## [0.1.0] - 2026-10-16
 
 First release.

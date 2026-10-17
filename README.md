@@ -323,12 +323,12 @@ curl -sSL https://github.com/25Dark25.gpg | gpg --import
 Invoke-WebRequest https://github.com/25Dark25.gpg -OutFile 25Dark25.gpg; gpg --import 25Dark25.gpg
 
 gpg --fingerprint A7FCEDEAD7E6C3437312284A442DA687E0FF73EE   # must match the fingerprint above
-gpg --verify onion-gate-0.1.0.zip.asc onion-gate-0.1.0.zip     # use the file names of the release you downloaded
+gpg --verify onion-gate-0.2.0.zip.asc onion-gate-0.2.0.zip     # use the file names of the release you downloaded
 ```
 
 `gpg` will report a good signature and also warn that the key is not certified; that is expected. What matters is that the fingerprint is the same in several independent places (this README, the release notes and keys.openpgp.org). A valid signature shows the file was published by whoever controls that key, not who that person is.
 
-To check the hash: `sha256sum onion-gate-0.1.0.zip` (Linux), `shasum -a 256 onion-gate-0.1.0.zip` (macOS) or `Get-FileHash onion-gate-0.1.0.zip -Algorithm SHA256` (PowerShell), and compare it with the release notes.
+To check the hash: `sha256sum onion-gate-0.2.0.zip` (Linux), `shasum -a 256 onion-gate-0.2.0.zip` (macOS) or `Get-FileHash onion-gate-0.2.0.zip -Algorithm SHA256` (PowerShell), and compare it with the release notes.
 
 ## Putting it in front of any server
 

@@ -5,6 +5,8 @@ All notable changes to this project are listed here. Versions follow
 
 ## Unreleased
 
+## [0.2.0] - 2026-10-17
+
 ### Changed
 
 - A request for a sub-resource (an image, a stylesheet...) without a valid
@@ -55,4 +57,5 @@ First release.
   `#![forbid(unsafe_code)]`, listens on 127.0.0.1 only. Read the README's
   Limitations and SECURITY.md before relying on it.
 
+[0.2.0]: https://github.com/25Dark25/onion-gate/releases/tag/v0.2.0
 [0.1.0]: https://github.com/25Dark25/onion-gate/releases/tag/v0.1.0

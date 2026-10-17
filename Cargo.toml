@@ -1,6 +1,6 @@
 [package]
 name = "onion-gate"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.82"
 description = "A no-JavaScript CAPTCHA gate and reverse proxy for a .onion (or loopback) backend. std only, zero dependencies, 127.0.0.1 only."

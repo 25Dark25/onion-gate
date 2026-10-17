@@ -162,6 +162,11 @@ cmd_check() {
     expect "challenge: Connection: close" has "$r" "Connection: close"
     expect "challenge: no JavaScript" lacks "$r" "<script"
 
+    # 2b. A sub-resource without a pass: a bare 403, no image drawn.
+    r=$(URL_PATH=/style.css gate "$G" 2 -i -H "Sec-Fetch-Dest: style")
+    expect "sub-resource without a pass: 403" status_is "$r" 403
+    expect "sub-resource without a pass: no challenge in it" lacks "$r" "$CHALLENGE"
+
     # 3. HEAD gets the headers and no body.
     r=$(gate "$G" 2 -I)
     expect "HEAD: 200" status_is "$r" 200

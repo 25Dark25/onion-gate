@@ -236,7 +236,7 @@ failure is worth a report with what you saw.
 | 16 | New Identity, then open the site | The CAPTCHA again (the cookie is gone) |
 | 17 | Restart the stack (Ctrl-C, `up` again), reload | The CAPTCHA again: passes do not survive a restart |
 | 18 | Open `/` in 10 tabs at once | Note what happens: some requests may get the "Too many requests from your connection" page (8 connections per circuit) |
-| 19 | Fail the CAPTCHA quickly, over and over | After about 10 images in a minute: "Too many requests from your connection. Wait a minute." (10 challenge images per circuit in a burst, 1 more every 6 s) |
+| 19 | Fail the CAPTCHA quickly, over and over | After about 5 wrong answers in a minute: "Too many requests from your connection. Wait a minute." (10 challenge permits per circuit in a burst, 1 more every 6 s; a wrong answer costs 2). Also note how often you fail when trying honestly: that is the human rate the defaults need |
 | 20 | Try the page on a narrow window (letterboxing) and with the dark/light theme | Text is readable; the image fits and keeps its 300×300 size |
 | 21 | With a pass, open the developer tools (Network), reload `/` | The image and stylesheet requests carry `Sec-Fetch-Dest: image` / `style` (how the gate tells a sub-resource from a page). If they do not, note it: the gate then relies on `Accept` |
 

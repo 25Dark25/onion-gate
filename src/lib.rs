@@ -283,13 +283,13 @@ fn gate_route(req: &Request, circuit: Option<u32>, app: &App) -> Reply {
             if !challenge_allowed(app, circuit) {
                 return too_many();
             }
-            new_challenge(app, app.limits.rounds, "", "/".to_string())
+            new_challenge(app, rounds(app), "", "/".to_string())
         }
         (_, true, VERIFY_PATH) => {
             if !challenge_allowed(app, circuit) {
                 return too_many();
             }
-            verify(req, app)
+            verify(req, app, circuit)
         }
         (_, _, VERIFY_PATH) => method_not_allowed("POST"),
         (_, _, p) if p == GATE_PREFIX => method_not_allowed("GET"),
@@ -421,7 +421,7 @@ fn gate(app: &App, circuit: Option<u32>, notice: &str, ret: String, clear: bool,
         app.metrics.subresources_refused.inc();
         Reply::page(403, String::new())
     } else if challenge_allowed(app, circuit) {
-        new_challenge(app, app.limits.rounds, notice, ret)
+        new_challenge(app, rounds(app), notice, ret)
     } else {
         too_many()
     };
@@ -432,8 +432,30 @@ fn gate(app: &App, circuit: Option<u32>, notice: &str, ret: String, clear: bool,
 }
 
 /// Generates a challenge, registers it and returns the page.
+/// Rounds a new chain needs: `rounds`, plus one while adaptive mode is under
+/// attack (at most 5). A bot that solves a round 59 % of the time then needs
+/// about twice as many images per pass; people pay one click, only then.
+fn rounds(app: &App) -> u8 {
+    let r = app.limits.rounds;
+    if app.adaptive.enabled() && !app.adaptive.calm() {
+        (r + 1).min(5)
+    } else {
+        r
+    }
+}
+
+/// A wrong or expired answer costs the circuit one more challenge permit, on
+/// top of the one the verification took: people rarely fail, a solver fails
+/// often (41 % of rounds for the reference solver).
+fn failed(app: &App, circuit: Option<u32>) {
+    app.metrics.verify_failed.inc();
+    if let Some(c) = circuit {
+        app.limiter.take(c);
+    }
+}
+
 fn new_challenge(app: &App, rounds_left: u8, notice: &str, ret: String) -> Reply {
-    let rounds = app.limits.rounds;
+    let rounds = rounds(app);
     let rounds_left = rounds_left.clamp(1, rounds);
     let mut rng = Rng::new();
     let ch = captcha::generate(&mut rng);
@@ -454,7 +476,7 @@ fn new_challenge(app: &App, rounds_left: u8, notice: &str, ret: String) -> Reply
     Reply::page(200, page)
 }
 
-fn verify(req: &Request, app: &App) -> Reply {
+fn verify(req: &Request, app: &App, circuit: Option<u32>) -> Reply {
     let store = &app.store;
     let body = std::str::from_utf8(&req.body).unwrap_or("");
 
@@ -465,8 +487,8 @@ fn verify(req: &Request, app: &App) -> Reply {
     let pending = match pending {
         Some(p) => p,
         None => {
-            app.metrics.verify_failed.inc();
-            return new_challenge(app, app.limits.rounds, MSG_FAIL, "/".to_string());
+            failed(app, circuit);
+            return new_challenge(app, rounds(app), MSG_FAIL, "/".to_string());
         }
     };
 
@@ -481,8 +503,8 @@ fn verify(req: &Request, app: &App) -> Reply {
     // 3) Same message for every failure: the reason is never revealed. A
     //    failure restarts from round 1 with a new image, keeping the return path.
     if !ok {
-        app.metrics.verify_failed.inc();
-        return new_challenge(app, app.limits.rounds, MSG_FAIL, pending.ret);
+        failed(app, circuit);
+        return new_challenge(app, rounds(app), MSG_FAIL, pending.ret);
     }
     if pending.rounds_left > 1 {
         app.metrics.verify_next_round.inc();

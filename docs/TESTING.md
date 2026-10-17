@@ -126,6 +126,12 @@ FUZZ_ITERS=3000000 FUZZ_SEED=7 cargo test --release --lib fuzz
 
 A failure prints the target, the seed and the input.
 
+CI also runs it once a week with 20 million inputs per target and a new seed
+each time (`.github/workflows/fuzz.yml`; it can be started by hand from the
+Actions tab). A failure there names the seed to reproduce it locally. GitHub
+turns scheduled workflows off after 60 days without activity in a public
+repository; re-enable it from the Actions tab if that happens.
+
 ### With libFuzzer (outside the repository)
 
 The `fuzzing` feature exposes the same targets to a coverage-guided fuzzer. It

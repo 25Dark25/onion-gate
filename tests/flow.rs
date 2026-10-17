@@ -634,3 +634,58 @@ fn under_attack_free_passes_are_revoked_and_solved_ones_survive() {
     assert!(send(port, 0x0D0D_0007, "GET", "/", None, None).starts_with("HTTP/1.1 303"), "free passes again");
     assert!(send(port, c, "GET", "/", Some(&solved), None).contains("BACKEND saw"), "the solved pass outlived both changes");
 }
+
+#[test]
+fn a_subresource_without_a_pass_gets_a_bare_403_and_costs_nothing() {
+    let (port, app) = start();
+    let c = 0x0E0E_0001;
+    let image = "Sec-Fetch-Dest: image\r\nAccept: image/avif,image/webp,*/*\r\n";
+    // Far more than the challenge burst (10): none of them draws an image or spends a permit.
+    for path in ["/style.css", "/img/1.png", "/does-not-exist.png"].iter().cycle().take(15) {
+        let r = send_with(port, c, "GET", path, None, None, image);
+        assert!(r.starts_with("HTTP/1.1 403 Forbidden\r\n"), "{}", &r[..r.len().min(200)]);
+        assert!(r.contains("Content-Length: 0\r\n") && r.contains("Cache-Control: no-store\r\n"));
+        assert!(r.ends_with("\r\n\r\n"), "no body");
+    }
+    assert_eq!(metrics_sample(&app, "onion_gate_challenges_total"), 0);
+    // Without Sec-Fetch-*, an Accept that leads with a non-HTML type says the same.
+    let css = send_with(port, c, "GET", "/style.css", None, None, "Accept: text/css,*/*;q=0.1\r\n");
+    assert!(css.starts_with("HTTP/1.1 403"));
+    // The navigation that follows still gets its challenge: no permit was spent.
+    let nav = "Sec-Fetch-Dest: document\r\nAccept: text/html,application/xhtml+xml,*/*;q=0.8\r\n";
+    assert!(is_challenge(&send_with(port, c, "GET", "/", None, None, nav)));
+}
+
+#[test]
+fn in_doubt_the_answer_is_still_the_challenge() {
+    let (port, _app) = start();
+    let c = 0x0E0E_0002;
+    for extra in ["", "Accept: */*\r\n", "Accept: text/html\r\n", "Sec-Fetch-Dest: iframe\r\n", "Accept: \r\n"] {
+        let r = send_with(port, c, "GET", "/x", None, None, extra);
+        assert!(is_challenge(&r), "{:?}: {}", extra, &r[..r.len().min(120)]);
+    }
+    // A form post is a navigation, whatever it says.
+    let r = send_with(port, c, "POST", "/form", None, Some("a=1"), "Sec-Fetch-Dest: image\r\n");
+    assert!(is_challenge(&r));
+}
+
+#[test]
+fn a_subresource_with_a_spent_pass_gets_the_403_too() {
+    let (port, app) = start_limits(Limits { pass_burst: 1, pass_per_minute: 1, ..Limits::default() });
+    let c = 0x0E0E_0003;
+    let pass = pass_for(port, &app, c);
+    assert!(send(port, c, "GET", "/", Some(&pass), None).contains("BACKEND saw"));
+    let r = send_with(port, c, "GET", "/a.png", Some(&pass), None, "Sec-Fetch-Dest: image\r\n");
+    assert!(r.starts_with("HTTP/1.1 403") && r.contains("Max-Age=0"), "403 and the dead cookie cleared");
+}
+
+#[test]
+fn adaptive_calm_still_gives_a_subresource_a_free_pass() {
+    let (port, _app) = start_limits(adaptive_limits());
+    let r = send_with(port, 0x0E0E_0004, "GET", "/a.png", None, None, "Sec-Fetch-Dest: image\r\n");
+    assert!(r.starts_with("HTTP/1.1 303"), "the redirect loads the image with the new pass");
+}
+
+fn metrics_sample(app: &App, name: &str) -> u64 {
+    sample(&metrics::render(app), name)
+}

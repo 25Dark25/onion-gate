@@ -309,17 +309,18 @@ fn gated<'a>(req: &Request, circuit: Option<u32>, app: &'a App) -> Out<'a> {
         "/".to_string()
     };
 
+    let sub = is_subresource(req);
     let pass = match presented_pass(req) {
-        None => return Out::Reply(arrival(app, circuit, ret, false)),
-        Some(None) => return Out::Reply(arrival(app, circuit, ret, true)),
+        None => return Out::Reply(arrival(app, circuit, ret, false, sub)),
+        Some(None) => return Out::Reply(arrival(app, circuit, ret, true, sub)),
         Some(Some(t)) => t,
     };
     match app.store.use_pass(&pass) {
         PassUse::Ok => {}
-        PassUse::Invalid => return Out::Reply(arrival(app, circuit, ret, true)),
+        PassUse::Invalid => return Out::Reply(arrival(app, circuit, ret, true, sub)),
         PassUse::Exhausted => {
             app.metrics.revoked_pass_budget.inc();
-            return Out::Reply(gate(app, circuit, MSG_RATE, ret, true));
+            return Out::Reply(gate(app, circuit, MSG_RATE, ret, true, sub));
         }
     }
     // The circuit's own page budget (catches several passes on one circuit).
@@ -327,7 +328,7 @@ fn gated<'a>(req: &Request, circuit: Option<u32>, app: &'a App) -> Out<'a> {
         if !app.limiter.take_page(c) {
             app.metrics.revoked_circuit_budget.inc();
             app.store.revoke_pass(&pass);
-            return Out::Reply(gate(app, circuit, MSG_RATE, ret, true));
+            return Out::Reply(gate(app, circuit, MSG_RATE, ret, true, sub));
         }
     }
 
@@ -359,13 +360,40 @@ fn gated<'a>(req: &Request, circuit: Option<u32>, app: &'a App) -> Out<'a> {
 /// A request for the site without a valid pass: the challenge, or, in
 /// adaptive mode while calm, a free pass. A pass that spent its budget does
 /// not come here: it always gets the challenge.
-fn arrival(app: &App, circuit: Option<u32>, ret: String, clear: bool) -> Reply {
+fn arrival(app: &App, circuit: Option<u32>, ret: String, clear: bool, sub: bool) -> Reply {
     app.metrics.arrivals.inc();
     if app.adaptive.calm() {
         free_pass(app, circuit, ret)
     } else {
-        gate(app, circuit, "", ret, clear)
+        gate(app, circuit, "", ret, clear, sub)
     }
+}
+
+/// Is this a request for part of a page (an image, a stylesheet, a font, a
+/// fetch) rather than a page the visitor navigates to? A challenge page is no
+/// use as an image, so such a request gets a bare 403 instead: no image is
+/// drawn and no challenge permit is spent. The browser says so in
+/// `Sec-Fetch-Dest`; without it, an `Accept` that leads with a specific
+/// non-HTML type (`image/...`, `text/css`) says so too. In doubt (no header,
+/// `*/*` alone, anything mentioning HTML) the answer is the challenge, as
+/// always. The answer does not depend on the path, so it reveals nothing.
+fn is_subresource(req: &Request) -> bool {
+    if !(req.is_get() || req.method == "HEAD") {
+        return false;
+    }
+    let header = |name: &str| {
+        req.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.to_ascii_lowercase())
+    };
+    if let Some(dest) = header("sec-fetch-dest") {
+        return !matches!(dest.as_str(), "document" | "iframe" | "frame" | "embed" | "object");
+    }
+    header("accept").is_some_and(|a| {
+        let first = a.split(',').next().unwrap_or("").trim();
+        !a.contains("text/html") && !first.is_empty() && !first.starts_with("*/*")
+    })
 }
 
 /// A pass without a CAPTCHA and a 303 back to the same URL. It costs a
@@ -378,7 +406,7 @@ fn free_pass(app: &App, circuit: Option<u32>, ret: String) -> Reply {
     let pass = Rng::new().token();
     if !app.store.add_free_pass(pass) {
         app.metrics.store_full.inc();
-        return gate(app, None, "", ret, false); // permit already taken
+        return gate(app, None, "", ret, false, false); // permit already taken
     }
     app.metrics.free_passes.inc();
     let mut r = Reply::redirect(ret);
@@ -386,9 +414,13 @@ fn free_pass(app: &App, circuit: Option<u32>, ret: String) -> Reply {
     r
 }
 
-/// Serves a challenge in place (200). `clear` deletes a dead pass cookie.
-fn gate(app: &App, circuit: Option<u32>, notice: &str, ret: String, clear: bool) -> Reply {
-    let mut r = if challenge_allowed(app, circuit) {
+/// Serves a challenge in place (200), or a bare 403 to a sub-resource
+/// request (`sub`, see `is_subresource`). `clear` deletes a dead pass cookie.
+fn gate(app: &App, circuit: Option<u32>, notice: &str, ret: String, clear: bool, sub: bool) -> Reply {
+    let mut r = if sub {
+        app.metrics.subresources_refused.inc();
+        Reply::page(403, String::new())
+    } else if challenge_allowed(app, circuit) {
         new_challenge(app, app.limits.rounds, notice, ret)
     } else {
         too_many()
